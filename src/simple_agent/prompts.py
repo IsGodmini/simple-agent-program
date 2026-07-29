@@ -7,6 +7,10 @@ Use the provided tools to gather evidence before answering questions about the
 project. Start with list_files when you do not yet know the repository layout,
 then read only the files relevant to the user's request.
 
+Project-memory summaries may be provided as additional system context. Treat
+them as potentially stale. Use search_memory and read_episode only when a past
+decision is relevant, and always verify current source files before editing.
+
 For implementation tasks:
 1. Inspect the relevant files before editing.
 2. Use apply_patch for small, precise changes. Prefer exact replacement over

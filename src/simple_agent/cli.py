@@ -2,31 +2,41 @@
 
 import argparse
 from pathlib import Path
+from typing import Optional
 
 from .agent import Agent
 from .config import Settings
 from .context import ContextBudget, ContextManager
 from .llm import OpenAICompatibleLLM
-from .session import write_trace
+from .memory import ProjectMemoryStore
+from .session import SessionManager, write_trace
 from .tools import (
     ApplyPatchTool,
     ListFilesTool,
+    ReadEpisodeTool,
     ReadFileTool,
     RunCommandTool,
+    SearchMemoryTool,
     ToolRegistry,
 )
 from .workspace import Workspace
 
 
-def build_agent(workspace_path: Path) -> Agent:
+def build_agent(
+    workspace_path: Path,
+    memory_store: Optional[ProjectMemoryStore] = None,
+) -> Agent:
     settings = Settings.from_env()
     workspace = Workspace(workspace_path)
+    memory_store = memory_store or ProjectMemoryStore(workspace)
     tools = ToolRegistry(
         [
             ListFilesTool(workspace),
             ReadFileTool(workspace),
             ApplyPatchTool(workspace),
             RunCommandTool(workspace),
+            SearchMemoryTool(memory_store),
+            ReadEpisodeTool(memory_store),
         ]
     )
     return Agent(
@@ -66,7 +76,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     request = " ".join(args.request)
-    result = build_agent(args.workspace).run(request)
+    workspace = Workspace(args.workspace)
+    memory_store = ProjectMemoryStore(workspace)
+    session_manager = SessionManager(memory_store)
+    task = session_manager.start_task(request)
+    try:
+        result = build_agent(
+            args.workspace,
+            memory_store=memory_store,
+        ).run(
+            request,
+            context_messages=task.context_messages,
+        )
+    except Exception as exc:
+        session_manager.fail_task(task, exc)
+        raise
+    session_manager.complete_task(task, result)
     if args.trace_file:
         write_trace(args.trace_file, request, result)
     print(result.content)

@@ -66,8 +66,16 @@ class ContextManager:
         if len(active) < 2:
             self._raise_limit(estimated)
 
-        fixed = active[:2]
-        blocks = self._interaction_blocks(active[2:])
+        first_assistant = next(
+            (
+                index
+                for index, message in enumerate(active)
+                if message.get("role") == "assistant"
+            ),
+            len(active),
+        )
+        fixed = active[:first_assistant]
+        blocks = self._interaction_blocks(active[first_assistant:])
         removed = 0
 
         while len(blocks) > 1:

@@ -85,6 +85,30 @@ class ContextManagerTests(unittest.TestCase):
                 compact_at_tokens=80,
             )
 
+    def test_cross_task_system_context_is_preserved_during_compaction(self):
+        manager = ContextManager(
+            ContextBudget(
+                context_window=2_000,
+                max_input_tokens=1_500,
+                max_output_tokens=500,
+                compact_at_tokens=500,
+            )
+        )
+        messages = [
+            {"role": "system", "content": "agent instructions"},
+            {"role": "system", "content": "persistent project summary"},
+            {"role": "user", "content": "new requirement"},
+            *tool_block("old-call", "old content " * 200),
+            *tool_block("latest-call", "latest result"),
+        ]
+
+        prepared = manager.prepare(messages, [])
+        serialized = str(prepared.messages)
+
+        self.assertIn("persistent project summary", serialized)
+        self.assertIn("new requirement", serialized)
+        self.assertNotIn("old-call", serialized)
+
 
 class FakeCompletions:
     def __init__(self):

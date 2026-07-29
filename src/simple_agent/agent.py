@@ -1,7 +1,7 @@
 """Tool-using agent loop."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .context import ContextManager
 from .llm import ChatModel, Message
@@ -49,12 +49,17 @@ class Agent:
         self.system_prompt = system_prompt
         self.context_manager = context_manager
 
-    def run(self, user_request: str) -> AgentResult:
+    def run(
+        self,
+        user_request: str,
+        context_messages: Optional[Sequence[Message]] = None,
+    ) -> AgentResult:
         if not user_request.strip():
             raise ValueError("user request cannot be empty")
 
         messages: List[Message] = [
             {"role": "system", "content": self.system_prompt},
+            *(dict(message) for message in (context_messages or [])),
             {"role": "user", "content": user_request},
         ]
         tool_executions: List[ToolExecution] = []

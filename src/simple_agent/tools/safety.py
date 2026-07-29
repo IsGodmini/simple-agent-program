@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-DENIED_PATH_NAMES = {".git", ".venv", "__pycache__"}
+DENIED_PATH_NAMES = {".git", ".simple-agent", ".venv", "__pycache__"}
 
 
 def is_sensitive_name(name: str) -> bool:

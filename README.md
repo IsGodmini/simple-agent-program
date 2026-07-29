@@ -13,6 +13,8 @@
 - 按需将完整执行过程保存为 JSON
 - 请求前估算上下文 Token，并在 80K 时安全压缩旧工具交互
 - 将输入限制在 96K、输出限制在 16K，总预算为 128K
+- 将单次需求工作上下文与跨需求项目记忆分离
+- 自动保存任务摘要，并按需检索详细情景记忆
 - 限制工具只能访问指定工作目录
 - 隐藏并拒绝读取 `.env`、私钥和 Git 内部文件
 - 最大迭代次数保护
@@ -54,6 +56,8 @@ simple-agent \
 - `read_file`：读取带行号的 UTF-8 文本
 - `apply_patch`：创建文件，或通过唯一的 `old_text` 精确替换文本
 - `run_command`：运行允许列表内的命令，不经过 Shell
+- `search_memory`：搜索之前需求的紧凑摘要
+- `read_episode`：按任务 ID 读取详细情景记忆
 
 `run_command` 当前支持 Python 的 `unittest`、`pytest`、`compileall`、
 `ruff`、`mypy`，常用的测试/构建型 npm、pnpm、yarn、Go、Cargo 命令，
@@ -76,6 +80,28 @@ AGENT_COMPACT_AT_TOKENS=80000
 Agent 会使用保守的 UTF-8 长度估算请求 Token。在达到压缩阈值后，只会
 淘汰完整的旧工具交互块，保留最初的系统消息、用户任务和最新工具结果。
 如果安全压缩后仍超过输入上限，请求会在本地终止。
+
+## 跨需求记忆
+
+每次 CLI 调用被视为一个独立需求。需求内部的模型消息、工具调用和工具结果
+构成临时工作上下文；需求结束后，只把紧凑摘要自动提供给后续需求，原始过程
+不会自动进入新上下文。
+
+本地记忆结构：
+
+```text
+.simple-agent/
+├── memory/
+│   └── task_summaries.json
+└── episodes/
+    └── <task-id>.json
+```
+
+`task_summaries.json` 记录需求、结果、修改文件和验证命令。Episode 保存完整
+消息和工具执行过程，只能通过 `search_memory` / `read_episode` 按需访问。
+`.simple-agent` 已被 Git 和普通文件工具忽略。
+
+记忆可能落后于当前代码，因此 Agent 会把当前文件和测试结果作为最终事实来源。
 
 ## 测试
 
