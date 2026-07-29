@@ -20,17 +20,20 @@ class Settings:
     model: str
     base_url: str
     api_key: str
-    max_iterations: int = 12
+    max_iterations: int = 64
+    total_iteration_budget: int = 512
+    iteration_extension: int = 16
+    stagnation_limit: int = 6
     context_window: int = 128_000
     max_input_tokens: int = 96_000
     max_output_tokens: int = 16_000
     compact_at_tokens: int = 80_000
     agent_mode: str = "auto"
     plan_complexity_threshold: int = 3
-    max_plan_steps: int = 8
-    max_step_revisions: int = 1
-    planner_max_iterations: int = 6
-    reviewer_max_iterations: int = 6
+    max_plan_steps: int = 12
+    max_step_revisions: int = 2
+    planner_max_iterations: int = 24
+    reviewer_max_iterations: int = 24
 
     def __post_init__(self) -> None:
         budget_values = (
@@ -48,6 +51,9 @@ class Settings:
             self.max_plan_steps,
             self.planner_max_iterations,
             self.reviewer_max_iterations,
+            self.total_iteration_budget,
+            self.iteration_extension,
+            self.stagnation_limit,
         )
         if any(value < 1 for value in workflow_values):
             raise ValueError("all workflow limits must be positive")
@@ -72,7 +78,16 @@ class Settings:
             model=os.getenv("LLM_MODEL", "ark-code-latest"),
             base_url=_required_env("LLM_BASE_URL"),
             api_key=_required_env("LLM_API_KEY"),
-            max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "12")),
+            max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "64")),
+            total_iteration_budget=int(
+                os.getenv("AGENT_TOTAL_ITERATION_BUDGET", "512")
+            ),
+            iteration_extension=int(
+                os.getenv("AGENT_ITERATION_EXTENSION", "16")
+            ),
+            stagnation_limit=int(
+                os.getenv("AGENT_STAGNATION_LIMIT", "6")
+            ),
             context_window=int(os.getenv("LLM_CONTEXT_WINDOW", "128000")),
             max_input_tokens=int(os.getenv("LLM_MAX_INPUT_TOKENS", "96000")),
             max_output_tokens=int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "16000")),
@@ -83,14 +98,14 @@ class Settings:
             plan_complexity_threshold=int(
                 os.getenv("AGENT_PLAN_COMPLEXITY_THRESHOLD", "3")
             ),
-            max_plan_steps=int(os.getenv("AGENT_MAX_PLAN_STEPS", "8")),
+            max_plan_steps=int(os.getenv("AGENT_MAX_PLAN_STEPS", "12")),
             max_step_revisions=int(
-                os.getenv("AGENT_MAX_STEP_REVISIONS", "1")
+                os.getenv("AGENT_MAX_STEP_REVISIONS", "2")
             ),
             planner_max_iterations=int(
-                os.getenv("AGENT_PLANNER_MAX_ITERATIONS", "6")
+                os.getenv("AGENT_PLANNER_MAX_ITERATIONS", "24")
             ),
             reviewer_max_iterations=int(
-                os.getenv("AGENT_REVIEWER_MAX_ITERATIONS", "6")
+                os.getenv("AGENT_REVIEWER_MAX_ITERATIONS", "24")
             ),
         )

@@ -5,7 +5,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .agent import Agent, AgentResult, ToolExecution
+from .agent import Agent, AgentResult, IterationBudget, ToolExecution
 from .context import ContextManager
 from .llm import ChatModel, Message
 from .prompts import (
@@ -235,11 +235,14 @@ class WorkflowConfig:
 
     mode: str = "auto"
     complexity_threshold: int = 3
-    max_plan_steps: int = 8
-    max_step_revisions: int = 1
-    planner_iterations: int = 6
-    executor_iterations: int = 12
-    reviewer_iterations: int = 6
+    max_plan_steps: int = 12
+    max_step_revisions: int = 2
+    planner_iterations: int = 24
+    executor_iterations: int = 64
+    reviewer_iterations: int = 24
+    total_iteration_budget: int = 512
+    iteration_extension: int = 16
+    stagnation_limit: int = 6
 
     def __post_init__(self) -> None:
         if self.mode not in {"auto", "react", "plan"}:
@@ -250,6 +253,9 @@ class WorkflowConfig:
             self.planner_iterations,
             self.executor_iterations,
             self.reviewer_iterations,
+            self.total_iteration_budget,
+            self.iteration_extension,
+            self.stagnation_limit,
         )
         if any(value < 1 for value in values):
             raise ValueError("workflow limits must be positive")
@@ -370,6 +376,8 @@ class PlannerAgent:
             context_manager=context_manager,
             progress_callback=progress_callback,
             progress_role="planner",
+            iteration_extension=config.iteration_extension,
+            stagnation_limit=config.stagnation_limit,
         )
         self.max_steps = config.max_plan_steps
 
@@ -405,6 +413,8 @@ class ReflectionAgent:
             context_manager=context_manager,
             progress_callback=progress_callback,
             progress_role="reviewer",
+            iteration_extension=config.iteration_extension,
+            stagnation_limit=config.stagnation_limit,
         )
 
     def review(
@@ -462,6 +472,11 @@ class WorkflowOrchestrator:
     ) -> AgentResult:
         if not user_request.strip():
             raise ValueError("user request cannot be empty")
+        self._iteration_budget = IterationBudget(
+            self.config.total_iteration_budget
+        )
+        self.planner.agent.iteration_budget = self._iteration_budget
+        self.reviewer.agent.iteration_budget = self._iteration_budget
         context = list(context_messages or [])
         assessment = self.router.assess(user_request, self.config.mode)
         self._emit(
@@ -478,6 +493,7 @@ class WorkflowOrchestrator:
         self._workflow_state: Dict[str, Any] = {
             "mode": assessment.mode,
             "assessment": asdict(assessment),
+            "iteration_budget": self._budget_dict(),
         }
         try:
             if assessment.mode == "react":
@@ -557,6 +573,7 @@ class WorkflowOrchestrator:
             "mode": "react",
             "assessment": asdict(assessment),
             "reviews": [asdict(review) for review in reviews],
+            "iteration_budget": self._budget_dict(),
         }
         self._emit("workflow_completed", message="需求执行与评审已完成")
         return result
@@ -752,6 +769,7 @@ class WorkflowOrchestrator:
             "plan": _plan_dict(plan),
             "steps": step_records,
             "reviews": reviews,
+            "iteration_budget": self._budget_dict(),
         }
         self._emit("workflow_completed", message="计划、执行与评审已全部完成")
         return result
@@ -769,6 +787,9 @@ class WorkflowOrchestrator:
             context_manager=self.context_manager,
             progress_callback=self.progress_callback,
             progress_role="executor",
+            iteration_budget=self._iteration_budget,
+            iteration_extension=self.config.iteration_extension,
+            stagnation_limit=self.config.stagnation_limit,
         ).run(request, context_messages=context)
 
     def _review_and_revise(
@@ -841,6 +862,16 @@ class WorkflowOrchestrator:
         except Exception:
             return
 
+    def _budget_dict(self) -> Dict[str, int]:
+        return {
+            "used": self._iteration_budget.used,
+            "maximum": self._iteration_budget.maximum,
+            "remaining": (
+                self._iteration_budget.maximum
+                - self._iteration_budget.used
+            ),
+        }
+
     def _synthesize(
         self,
         request: str,
@@ -848,6 +879,16 @@ class WorkflowOrchestrator:
         completed_steps: List[Dict[str, str]],
         reviews: List[Dict[str, Any]],
     ) -> str:
+        if not self._iteration_budget.consume():
+            self._emit(
+                "requirement_budget_reached",
+                used=self._iteration_budget.used,
+                maximum=self._iteration_budget.maximum,
+                message="整个需求已达到灾难保护调用上限",
+            )
+            raise WorkflowError(
+                "requirement exceeded its last-resort model-call budget"
+            )
         message = {
             "role": "user",
             "content": json.dumps(

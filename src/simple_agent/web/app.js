@@ -292,12 +292,24 @@ function renderWorkflow(job) {
       }
       const marker = node("i");
       const copy = node("div");
+      const iterationMeta = event.iteration
+        ? `第 ${event.iteration} 轮`
+        : "";
+      const budgetMeta = event.requirement_maximum
+        ? `总预算 ${event.requirement_used}/${event.requirement_maximum}`
+        : "";
       copy.append(
         node("strong", "", event.message || event.event),
         node(
           "span",
           "",
-          [event.role, event.tool, formatTime(event.timestamp)]
+          [
+            event.role,
+            event.tool,
+            iterationMeta,
+            budgetMeta,
+            formatTime(event.timestamp),
+          ]
             .filter(Boolean)
             .join(" · "),
         ),
@@ -356,13 +368,17 @@ function renderWorkflow(job) {
       ),
     );
   }
+  const iterationBudget = workflow.iteration_budget || {};
+  const budgetText = iterationBudget.maximum
+    ? ` · 需求总预算 ${iterationBudget.used}/${iterationBudget.maximum}`
+    : "";
   elements.workflowView.append(
     workflowCard(
       "运行统计",
       "DONE",
       `${job.result.iterations || 0} 次模型迭代 · ${
         job.result.compactions || 0
-      } 次上下文压缩`,
+      } 次上下文压缩${budgetText}`,
     ),
   );
 }

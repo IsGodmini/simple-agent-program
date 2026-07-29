@@ -200,6 +200,10 @@ class WorkflowOrchestratorTests(unittest.TestCase):
             self.assertEqual(result.content, "项目包含 README。")
             self.assertEqual(result.workflow["mode"], "react")
             self.assertEqual(result.workflow["reviews"], [])
+            self.assertEqual(
+                result.workflow["iteration_budget"],
+                {"used": 1, "maximum": 512, "remaining": 511},
+            )
             self.assertEqual(len(llm.requests), 1)
 
     def test_react_mutation_is_reviewed_before_completion(self):

@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from simple_agent.agent import Agent
+from simple_agent.agent import Agent, IterationBudget
 from simple_agent.tools import ListFilesTool, ReadFileTool, ToolRegistry
 from simple_agent.workspace import Workspace
 
@@ -95,16 +95,85 @@ class AgentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot be empty"):
                 Agent(FakeLLM([]), registry).run(" ")
 
-    def test_iteration_limit_is_enforced(self):
+    def test_repeated_tool_results_stop_as_stagnation(self):
         with TemporaryDirectory() as directory:
             registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
             repeated_call = assistant_message(
                 tool_calls=[tool_call("call-1", "list_files", {})]
             )
-            with self.assertRaisesRegex(RuntimeError, "exceeded"):
-                Agent(FakeLLM([repeated_call]), registry, max_iterations=1).run(
-                    "Keep looking"
+            events = []
+            with self.assertRaisesRegex(RuntimeError, "without new evidence"):
+                Agent(
+                    FakeLLM([repeated_call, repeated_call, repeated_call]),
+                    registry,
+                    max_iterations=1,
+                    progress_callback=events.append,
+                    iteration_extension=1,
+                    stagnation_limit=2,
+                ).run("Keep looking")
+            self.assertEqual(events[-1]["event"], "stagnation_detected")
+            self.assertEqual(events[-1]["stagnant_iterations"], 2)
+
+    def test_new_evidence_extends_initial_iteration_allowance(self):
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            llm = FakeLLM(
+                [
+                    assistant_message(
+                        tool_calls=[
+                            tool_call("call-1", "list_files", {"offset": 0})
+                        ]
+                    ),
+                    assistant_message(
+                        tool_calls=[
+                            tool_call("call-2", "list_files", {"offset": 1})
+                        ]
+                    ),
+                    assistant_message(content="调查完成"),
+                ]
+            )
+            events = []
+
+            result = Agent(
+                llm,
+                registry,
+                max_iterations=1,
+                progress_callback=events.append,
+                iteration_extension=1,
+                stagnation_limit=2,
+            ).run("继续调查")
+
+            self.assertEqual(result.iterations, 3)
+            extensions = [
+                event
+                for event in events
+                if event["event"] == "iteration_budget_extended"
+            ]
+            self.assertEqual([event["allowance"] for event in extensions], [2, 3])
+
+    def test_requirement_wide_budget_is_last_resort_cap(self):
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            calls = [
+                assistant_message(
+                    tool_calls=[
+                        tool_call(f"call-{index}", "list_files", {"offset": index})
+                    ]
                 )
+                for index in range(3)
+            ]
+            events = []
+
+            with self.assertRaisesRegex(RuntimeError, "last-resort"):
+                Agent(
+                    FakeLLM(calls),
+                    registry,
+                    iteration_budget=IterationBudget(2),
+                    progress_callback=events.append,
+                ).run("持续调查")
+
+            self.assertEqual(events[-1]["event"], "requirement_budget_reached")
+            self.assertEqual(events[-1]["used"], 2)
 
 
 class FileToolTests(unittest.TestCase):
