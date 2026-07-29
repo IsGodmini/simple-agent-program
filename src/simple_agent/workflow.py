@@ -36,6 +36,14 @@ class WorkflowBlockedError(WorkflowError):
         self.workflow = workflow
 
 
+class WorkflowFinalized(RuntimeError):
+    """Internal signal carrying a safe final answer from a stopped sub-agent."""
+
+    def __init__(self, result: AgentResult) -> None:
+        super().__init__(result.stop_reason or "workflow finalized")
+        self.result = result
+
+
 @dataclass(frozen=True)
 class ComplexityAssessment:
     """Deterministic routing decision for one user requirement."""
@@ -240,7 +248,7 @@ class WorkflowConfig:
     planner_iterations: int = 24
     executor_iterations: int = 64
     reviewer_iterations: int = 24
-    total_iteration_budget: int = 512
+    total_iteration_budget: int = 96
     iteration_extension: int = 16
     stagnation_limit: int = 6
 
@@ -387,6 +395,8 @@ class PlannerAgent:
         context_messages: Sequence[Message],
     ) -> Tuple[TaskPlan, AgentResult]:
         result = self.agent.run(request, context_messages=context_messages)
+        if result.stop_reason:
+            raise WorkflowFinalized(result)
         plan = TaskPlan.from_dict(
             _extract_json_object(result.content),
             self.max_steps,
@@ -426,6 +436,8 @@ class ReflectionAgent:
             json.dumps(review_request, ensure_ascii=False, indent=2),
             context_messages=context_messages,
         )
+        if result.stop_reason:
+            raise WorkflowFinalized(result)
         review = ReviewResult.from_dict(_extract_json_object(result.content))
         return review, result
 
@@ -475,6 +487,7 @@ class WorkflowOrchestrator:
         self._iteration_budget = IterationBudget(
             self.config.total_iteration_budget
         )
+        self._completed_results: List[AgentResult] = []
         self.planner.agent.iteration_budget = self._iteration_budget
         self.reviewer.agent.iteration_budget = self._iteration_budget
         context = list(context_messages or [])
@@ -499,6 +512,24 @@ class WorkflowOrchestrator:
             if assessment.mode == "react":
                 return self._run_react(user_request, context, assessment)
             return self._run_plan(user_request, context, assessment)
+        except WorkflowFinalized as finalized:
+            result = _merge_results(
+                [*self._completed_results, finalized.result],
+                finalized.result.content,
+            )
+            result.stop_reason = finalized.result.stop_reason
+            result.workflow = {
+                **self._workflow_state,
+                "status": "stopped_with_answer",
+                "stop_reason": result.stop_reason,
+                "iteration_budget": self._budget_dict(),
+            }
+            self._emit(
+                "workflow_stopped_with_answer",
+                stop_reason=result.stop_reason,
+                message="工作流已安全停止并返回最终答复",
+            )
+            return result
         except WorkflowBlockedError as exc:
             if exc.workflow is None:
                 exc.workflow = dict(self._workflow_state)
@@ -591,6 +622,7 @@ class WorkflowOrchestrator:
             planning_request or request,
             context,
         )
+        self._completed_results.append(planning_result)
         self._emit(
             "plan_created",
             goal=plan.goal,
@@ -709,6 +741,7 @@ class WorkflowOrchestrator:
             final_review_request,
             context,
         )
+        self._completed_results.append(final_review_result)
         self._emit(
             "review_completed",
             scope="final",
@@ -741,6 +774,7 @@ class WorkflowOrchestrator:
                 repaired_review_request,
                 context,
             )
+            self._completed_results.append(reviewed_repair)
             all_results.append(reviewed_repair)
             reviews.append(
                 {"scope": "final-repair", **asdict(final_review)}
@@ -779,7 +813,7 @@ class WorkflowOrchestrator:
         request: str,
         context: Sequence[Message],
     ) -> AgentResult:
-        return Agent(
+        result = Agent(
             self.llm,
             self.executor_tools,
             max_iterations=self.config.executor_iterations,
@@ -791,6 +825,10 @@ class WorkflowOrchestrator:
             iteration_extension=self.config.iteration_extension,
             stagnation_limit=self.config.stagnation_limit,
         ).run(request, context_messages=context)
+        if result.stop_reason:
+            raise WorkflowFinalized(result)
+        self._completed_results.append(result)
+        return result
 
     def _review_and_revise(
         self,
@@ -821,6 +859,7 @@ class WorkflowOrchestrator:
                 review_request,
                 context,
             )
+            self._completed_results.append(review_agent_result)
             reviews.append(review)
             extra_results.append(review_agent_result)
             self._emit(

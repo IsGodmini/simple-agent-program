@@ -136,17 +136,24 @@ class AgentTests(unittest.TestCase):
                 tool_calls=[tool_call("call-1", "list_files", {})]
             )
             events = []
-            with self.assertRaisesRegex(RuntimeError, "without new evidence"):
-                Agent(
-                    FakeLLM([repeated_call, repeated_call, repeated_call]),
-                    registry,
-                    max_iterations=1,
-                    progress_callback=events.append,
-                    iteration_extension=1,
-                    stagnation_limit=2,
-                ).run("Keep looking")
-            self.assertEqual(events[-1]["event"], "stagnation_detected")
-            self.assertEqual(events[-1]["stagnant_iterations"], 2)
+            result = Agent(
+                FakeLLM([repeated_call, repeated_call, repeated_call]),
+                registry,
+                max_iterations=1,
+                progress_callback=events.append,
+                iteration_extension=1,
+                stagnation_limit=2,
+            ).run("Keep looking")
+
+            self.assertEqual(result.stop_reason, "stagnation")
+            self.assertTrue(result.content)
+            detected = [
+                event
+                for event in events
+                if event["event"] == "stagnation_detected"
+            ]
+            self.assertEqual(detected[0]["stagnant_iterations"], 2)
+            self.assertEqual(events[-1]["event"], "final_answer_completed")
 
     def test_new_evidence_extends_initial_iteration_allowance(self):
         with TemporaryDirectory() as directory:
@@ -198,16 +205,85 @@ class AgentTests(unittest.TestCase):
             ]
             events = []
 
-            with self.assertRaisesRegex(RuntimeError, "last-resort"):
-                Agent(
-                    FakeLLM(calls),
-                    registry,
-                    iteration_budget=IterationBudget(2),
-                    progress_callback=events.append,
-                ).run("持续调查")
+            result = Agent(
+                FakeLLM(calls),
+                registry,
+                iteration_budget=IterationBudget(2),
+                progress_callback=events.append,
+            ).run("持续调查")
 
-            self.assertEqual(events[-1]["event"], "requirement_budget_reached")
-            self.assertEqual(events[-1]["used"], 2)
+            self.assertEqual(result.stop_reason, "budget_exhausted")
+            self.assertTrue(result.content)
+            reached = [
+                event
+                for event in events
+                if event["event"] == "requirement_budget_reached"
+            ]
+            self.assertEqual(reached[0]["used"], 1)
+            self.assertEqual(events[-1]["event"], "final_answer_completed")
+
+    def test_model_failure_still_returns_local_fallback_answer(self):
+        class FailingLLM:
+            def complete(self, messages, tools=None):
+                raise ConnectionError("offline")
+
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            events = []
+
+            result = Agent(
+                FailingLLM(),
+                registry,
+                iteration_budget=IterationBudget(3),
+                progress_callback=events.append,
+            ).run("完成需求")
+
+            self.assertEqual(result.stop_reason, "model_error")
+            self.assertIn("停止原因", result.content)
+            completed = [
+                event
+                for event in events
+                if event["event"] == "final_answer_completed"
+            ]
+            self.assertFalse(completed[-1]["generated_by_model"])
+
+    def test_requirement_budget_warns_model_to_converge(self):
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            llm = FakeLLM(
+                [
+                    assistant_message(
+                        tool_calls=[
+                            tool_call("call-1", "list_files", {"offset": 0})
+                        ]
+                    ),
+                    assistant_message(content="已根据现有证据完成"),
+                ]
+            )
+            events = []
+
+            result = Agent(
+                llm,
+                registry,
+                iteration_budget=IterationBudget(3),
+                progress_callback=events.append,
+            ).run("完成调查")
+
+            self.assertEqual(result.iterations, 2)
+            warnings = [
+                event
+                for event in events
+                if event["event"] == "requirement_budget_low"
+            ]
+            self.assertEqual(len(warnings), 1)
+            self.assertEqual(warnings[0]["remaining"], 2)
+            second_request_messages = llm.requests[1][0]
+            self.assertTrue(
+                any(
+                    "立即收敛" in str(message.get("content", ""))
+                    for message in second_request_messages
+                )
+            )
 
 
 class FileToolTests(unittest.TestCase):

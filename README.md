@@ -243,7 +243,7 @@ LLM_MAX_OUTPUT_TOKENS=16000
 AGENT_COMPACT_AT_TOKENS=80000
 AGENT_MODE=auto
 AGENT_MAX_ITERATIONS=64
-AGENT_TOTAL_ITERATION_BUDGET=512
+AGENT_TOTAL_ITERATION_BUDGET=96
 AGENT_ITERATION_EXTENSION=16
 AGENT_STAGNATION_LIMIT=6
 AGENT_PLAN_COMPLEXITY_THRESHOLD=3
@@ -260,8 +260,14 @@ Agent 仍在读取新的证据、产生新的代码修改或获得新的测试�
 
 连续 `AGENT_STAGNATION_LIMIT` 轮只得到重复工具结果或工具参数错误时，系统才会
 认定 Agent 陷入无进展循环并停止。`AGENT_TOTAL_ITERATION_BUDGET` 是整个需求中
-所有 Planner、Executor、Reviewer 和最终结果整理共享的灾难保护上限，正常任务
-不应依赖它结束。Web 客户端会显示自动扩容、停滞计数和需求总预算使用情况。
+所有 Planner、Executor、Reviewer 和最终结果整理共享、不可突破的模型调用硬
+上限，默认 96 次。预算进入最后约 20%（最多保留 12 次）时，系统会向当前 Agent
+注入收敛指令，要求停止扩展调查范围，优先完成必要修改与验证，或明确报告阻塞。
+其中最后 1 次调用专门保留给无工具的最终答复：达到硬上限或检测到停滞时，
+系统会停止后续规划与评审，要求模型根据已有证据说明完成情况、验证结果和未完成
+事项。如果最终模型调用本身失败，系统会返回本地兜底答复，因此客户端不会因为
+循环保护只得到一个异常。Web 客户端会显示自动扩容、停滞计数、预算告警、强制
+收尾和需求总预算使用情况。
 
 Agent 会使用保守的 UTF-8 长度估算请求 Token。在达到压缩阈值后，只会
 淘汰完整的旧工具交互块，保留最初的系统消息、用户任务和最新工具结果。

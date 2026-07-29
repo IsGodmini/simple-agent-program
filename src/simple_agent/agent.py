@@ -31,11 +31,12 @@ class AgentResult:
     tool_executions: List[ToolExecution]
     compactions: int = 0
     workflow: Optional[Dict[str, Any]] = None
+    stop_reason: Optional[str] = None
 
 
 @dataclass
 class IterationBudget:
-    """A requirement-wide last-resort cap shared by all sub-agents."""
+    """A hard requirement-wide model-call cap shared by all sub-agents."""
 
     maximum: int
     used: int = 0
@@ -44,11 +45,22 @@ class IterationBudget:
         if self.maximum < 1:
             raise ValueError("iteration budget maximum must be positive")
 
-    def consume(self) -> bool:
-        if self.used >= self.maximum:
+    def consume(self, reserve_final: bool = False) -> bool:
+        limit = self.maximum - (1 if reserve_final else 0)
+        if self.used >= limit:
             return False
         self.used += 1
         return True
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.maximum - self.used)
+
+    @property
+    def warning_threshold(self) -> int:
+        """Reserve a small final window in which agents must converge."""
+
+        return min(12, max(2, self.maximum // 5))
 
 
 class Agent:
@@ -94,6 +106,16 @@ class Agent:
 
         messages: List[Message] = [
             {"role": "system", "content": self.system_prompt},
+            *(
+                [
+                    {
+                        "role": "system",
+                        "content": self._budget_guidance(),
+                    }
+                ]
+                if self.iteration_budget
+                else []
+            ),
             *(dict(message) for message in (context_messages or [])),
             {"role": "user", "content": user_request},
         ]
@@ -103,23 +125,60 @@ class Agent:
         seen_evidence: Set[str] = set()
         stagnant_iterations = 0
         iteration = 0
+        budget_warning_sent = False
 
         while True:
             iteration += 1
-            if self.iteration_budget and not self.iteration_budget.consume():
+            if (
+                self.iteration_budget
+                and not self.iteration_budget.consume(reserve_final=True)
+            ):
                 self._emit(
                     "requirement_budget_reached",
-                    iteration=iteration - 1,
+                    iteration=iteration,
                     used=self.iteration_budget.used,
                     maximum=self.iteration_budget.maximum,
                     message=(
-                        "整个需求已达到灾难保护调用上限；"
-                        "这是防止异常无限循环的最后保护"
+                        "执行调用额度已耗尽，正在使用保留调用生成最终答复"
                     ),
                 )
-                raise RuntimeError(
-                    "Requirement exceeded the last-resort model-call budget "
-                    f"of {self.iteration_budget.maximum}"
+                return self._force_final_answer(
+                    messages,
+                    tool_executions,
+                    compactions,
+                    iteration,
+                    "budget_exhausted",
+                    "需求已达到模型调用硬上限",
+                )
+            if (
+                self.iteration_budget
+                and not budget_warning_sent
+                and self.iteration_budget.remaining
+                <= self.iteration_budget.warning_threshold
+            ):
+                budget_warning_sent = True
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "需求共享模型调用预算即将耗尽：仅剩 "
+                            f"{self.iteration_budget.remaining} 次调用。立即收敛："
+                            "停止扩展调查范围，只执行完成当前需求所必需的修改和"
+                            "验证；如果已经具备足够证据，请直接返回最终结果；"
+                            "如果无法安全完成，请明确说明阻塞原因，不要继续尝试"
+                            "相似工具调用。"
+                        ),
+                    }
+                )
+                self._emit(
+                    "requirement_budget_low",
+                    iteration=iteration,
+                    requirement_used=self.iteration_budget.used,
+                    requirement_maximum=self.iteration_budget.maximum,
+                    remaining=self.iteration_budget.remaining,
+                    message=(
+                        "需求模型调用预算即将耗尽，Agent 已进入收敛阶段"
+                    ),
                 )
             self._emit(
                 "model_started",
@@ -151,7 +210,26 @@ class Agent:
                         removed_blocks=prepared.removed_blocks,
                         message="已压缩较早的工具交互以控制上下文长度",
                     )
-            assistant = self.llm.complete(messages, self.tools.definitions)
+            try:
+                assistant = self.llm.complete(
+                    messages,
+                    self.tools.definitions,
+                )
+            except Exception as exc:
+                self._emit(
+                    "model_failed",
+                    iteration=iteration,
+                    error=type(exc).__name__,
+                    message="模型请求异常，正在生成可展示的最终答复",
+                )
+                return self._force_final_answer(
+                    messages,
+                    tool_executions,
+                    compactions,
+                    iteration + 1,
+                    "model_error",
+                    f"模型请求异常：{type(exc).__name__}",
+                )
             messages.append(self._assistant_message(assistant))
 
             tool_calls = getattr(assistant, "tool_calls", None) or []
@@ -236,10 +314,16 @@ class Agent:
                             "已停止无进展循环"
                         ),
                     )
-                    raise RuntimeError(
-                        "Agent stopped after "
-                        f"{stagnant_iterations} consecutive tool rounds "
-                        "without new evidence"
+                    return self._force_final_answer(
+                        messages,
+                        tool_executions,
+                        compactions,
+                        iteration + 1,
+                        "stagnation",
+                        (
+                            f"连续 {stagnant_iterations} 轮工具调用"
+                            "没有产生新证据"
+                        ),
                     )
                 if iteration >= current_allowance:
                     previous_allowance = current_allowance
@@ -275,7 +359,131 @@ class Agent:
                     tool_executions=tool_executions,
                     compactions=compactions,
                 )
-            raise RuntimeError("Model returned neither content nor tool calls")
+            return self._force_final_answer(
+                messages,
+                tool_executions,
+                compactions,
+                iteration + 1,
+                "empty_model_response",
+                "模型返回了空响应",
+            )
+
+    def _force_final_answer(
+        self,
+        messages: List[Message],
+        tool_executions: List[ToolExecution],
+        compactions: int,
+        iteration: int,
+        stop_reason: str,
+        reason_text: str,
+    ) -> AgentResult:
+        """Spend the reserved call on a tool-free answer, then fall back locally."""
+
+        final_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "现在必须立即结束工具循环并给出面向用户的最终答复。禁止继续"
+                    "调用任何工具。请仅根据已经获得的证据说明：已完成什么、"
+                    "验证情况、尚未完成或无法确认的部分，以及建议的下一步。"
+                    f"停止原因：{reason_text}。不要声称未经验证的工作已经完成。"
+                ),
+            },
+        ]
+        self._emit(
+            "final_answer_started",
+            iteration=iteration,
+            stop_reason=stop_reason,
+            message="工具循环已停止，正在生成最终答复",
+        )
+        can_call_model = (
+            self.iteration_budget is None
+            or self.iteration_budget.consume()
+        )
+        if can_call_model:
+            try:
+                if self.context_manager:
+                    prepared = self.context_manager.prepare(final_messages, [])
+                    final_messages = prepared.messages
+                    compactions += prepared.removed_blocks
+                assistant = self.llm.complete(final_messages, [])
+                content = getattr(assistant, "content", None)
+                if isinstance(content, str) and content.strip():
+                    final_messages.append(self._assistant_message(assistant))
+                    self._emit(
+                        "final_answer_completed",
+                        iteration=iteration,
+                        stop_reason=stop_reason,
+                        generated_by_model=True,
+                        message="模型已基于现有证据给出最终答复",
+                    )
+                    return AgentResult(
+                        content=content.strip(),
+                        iterations=iteration,
+                        messages=final_messages,
+                        tool_executions=tool_executions,
+                        compactions=compactions,
+                        stop_reason=stop_reason,
+                    )
+            except Exception as exc:
+                self._emit(
+                    "final_answer_model_failed",
+                    iteration=iteration,
+                    stop_reason=stop_reason,
+                    error=type(exc).__name__,
+                    message="最终模型调用失败，正在生成本地兜底答复",
+                )
+
+        content = self._fallback_answer(
+            reason_text,
+            tool_executions,
+        )
+        final_messages.append({"role": "assistant", "content": content})
+        self._emit(
+            "final_answer_completed",
+            iteration=iteration,
+            stop_reason=stop_reason,
+            generated_by_model=False,
+            message="已生成本地兜底答复",
+        )
+        return AgentResult(
+            content=content,
+            iterations=iteration,
+            messages=final_messages,
+            tool_executions=tool_executions,
+            compactions=compactions,
+            stop_reason=stop_reason,
+        )
+
+    @staticmethod
+    def _fallback_answer(
+        reason_text: str,
+        tool_executions: Sequence[ToolExecution],
+    ) -> str:
+        tools = [execution.name for execution in tool_executions[-8:]]
+        activity = (
+            "、".join(tools)
+            if tools
+            else "尚未获得可确认的工具执行结果"
+        )
+        return (
+            "本次需求已停止继续执行，但未能获得模型生成的最终回复。\n\n"
+            f"- 停止原因：{reason_text}\n"
+            f"- 已执行的最近工具：{activity}\n"
+            "- 完成状态：无法确认需求已经完整实现\n"
+            "- 建议：检查当前工作区改动和测试结果后，再从未完成部分继续。"
+        )
+
+    def _budget_guidance(self) -> str:
+        assert self.iteration_budget is not None
+        return (
+            "本需求的 Planner、Executor、Reviewer 和结果整理共享一个不可突破"
+            f"的模型调用预算，共 {self.iteration_budget.maximum} 次；当前剩余 "
+            f"{self.iteration_budget.remaining} 次。每次调用都应推进需求：优先"
+            "复用项目索引，避免重复读取和无目的探索，获得足够证据后及时修改、"
+            "验证并结束。接近预算上限时必须收敛或明确报告阻塞。"
+        )
 
     @staticmethod
     def _evidence_fingerprint(

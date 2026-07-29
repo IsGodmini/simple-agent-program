@@ -21,7 +21,7 @@ class Settings:
     base_url: str
     api_key: str
     max_iterations: int = 64
-    total_iteration_budget: int = 512
+    total_iteration_budget: int = 96
     iteration_extension: int = 16
     stagnation_limit: int = 6
     context_window: int = 128_000
@@ -80,7 +80,7 @@ class Settings:
             api_key=_required_env("LLM_API_KEY"),
             max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "64")),
             total_iteration_budget=int(
-                os.getenv("AGENT_TOTAL_ITERATION_BUDGET", "512")
+                os.getenv("AGENT_TOTAL_ITERATION_BUDGET", "96")
             ),
             iteration_extension=int(
                 os.getenv("AGENT_ITERATION_EXTENSION", "16")

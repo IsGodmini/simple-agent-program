@@ -171,6 +171,53 @@ class TaskPlanTests(unittest.TestCase):
 
 
 class WorkflowOrchestratorTests(unittest.TestCase):
+    def test_budget_exhaustion_returns_reserved_final_answer(self):
+        with TemporaryDirectory() as directory:
+            workspace = Workspace(Path(directory))
+            tools = ToolRegistry([ListFilesTool(workspace)])
+            llm = FakeLLM(
+                [
+                    assistant_message(
+                        tool_calls=[
+                            tool_call("scan-1", "list_files", {"offset": 0})
+                        ]
+                    ),
+                    assistant_message(
+                        content="调用预算已用完；这是基于现有证据的最终答复。"
+                    ),
+                ]
+            )
+            events = []
+            workflow = WorkflowOrchestrator(
+                llm=llm,
+                executor_tools=tools,
+                planning_tools=tools,
+                review_tools=tools,
+                config=WorkflowConfig(
+                    mode="react",
+                    total_iteration_budget=2,
+                ),
+                progress_callback=events.append,
+            )
+
+            result = workflow.run("持续检查项目")
+
+            self.assertEqual(result.stop_reason, "budget_exhausted")
+            self.assertIn("最终答复", result.content)
+            self.assertEqual(
+                result.workflow["status"],
+                "stopped_with_answer",
+            )
+            self.assertEqual(
+                result.workflow["iteration_budget"],
+                {"used": 2, "maximum": 2, "remaining": 0},
+            )
+            self.assertEqual(llm.requests[-1][1], [])
+            self.assertIn(
+                "workflow_stopped_with_answer",
+                [event["event"] for event in events],
+            )
+
     def test_reports_routing_execution_and_completion_progress(self):
         with TemporaryDirectory() as directory:
             events = []
@@ -202,7 +249,7 @@ class WorkflowOrchestratorTests(unittest.TestCase):
             self.assertEqual(result.workflow["reviews"], [])
             self.assertEqual(
                 result.workflow["iteration_budget"],
-                {"used": 1, "maximum": 512, "remaining": 511},
+                {"used": 1, "maximum": 96, "remaining": 95},
             )
             self.assertEqual(len(llm.requests), 1)
 
