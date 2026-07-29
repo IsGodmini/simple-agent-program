@@ -17,6 +17,8 @@
 - 将输入限制在 96K、输出限制在 16K，总预算为 128K
 - 将单次需求工作上下文与跨需求项目记忆分离
 - 自动保存任务摘要，并按需检索详细情景记忆
+- 导入多格式项目资料并构建本地 RAG 知识库
+- 按需求自动检索相关规范，也可通过工具继续查询和精读
 - 限制工具只能访问指定工作目录
 - 隐藏并拒绝读取 `.env`、私钥和 Git 内部文件
 - 最大迭代次数保护
@@ -52,6 +54,47 @@ simple-agent \
   "为项目添加一个健康检查函数并运行测试"
 ```
 
+## 项目知识库
+
+知识库用于保存用户提供的开发注意事项、项目规范、设计文档和其他参考资料。
+导入操作完全在本地完成，不需要调用 LLM：
+
+```bash
+# 导入一个或多个文件
+simple-agent --workspace /path/to/project \
+  --knowledge-file ./开发规范.md \
+  --knowledge-file ./架构设计.pdf
+
+# 递归导入目录中的受支持文档
+simple-agent --workspace /path/to/project \
+  --knowledge-dir ./project-docs
+
+# 导入后立即执行需求
+simple-agent --workspace /path/to/project \
+  --knowledge-file ./接口规范.docx \
+  "实现用户注册接口"
+
+# 查看或删除已索引文档
+simple-agent --workspace /path/to/project --list-knowledge
+simple-agent --workspace /path/to/project \
+  --remove-knowledge <document-id>
+```
+
+支持的主要格式：
+
+- 文本及开发文件：TXT、Markdown、RST、代码、配置、YAML、TOML、SQL 等
+- 结构化数据：JSON、JSONL、CSV、TSV、HTML、XML
+- 办公文档：PDF、DOCX、PPTX、XLSX
+- 开放文档：ODT、EPUB
+
+旧版 DOC、PPT、XLS 需要先转换为对应的新版格式；扫描型 PDF 当前不包含 OCR，
+需要先转换为可搜索 PDF。单文件默认上限为 50 MiB，最多提取 200 万字符。
+
+文档会被解析、分块并写入项目的
+`.simple-agent/knowledge/knowledge.db`。检索使用 SQLite FTS5 和中英文词项，
+不依赖外部 Embedding 服务。每次新需求只自动注入少量相关片段，并保留
+`knowledge:<document-id>#chunk-<n>` 引用；完整知识库不会被塞入上下文。
+
 ## 工具
 
 - `repository_map`：统计技术栈清单、入口、扩展名和顶层模块
@@ -59,6 +102,9 @@ simple-agent \
 - `find_files`：使用 Glob 分页查找文件
 - `search_code`：搜索文本或正则表达式，返回文件和行号
 - `read_file`：使用行范围分段读取带行号的文本
+- `search_knowledge`：检索相关项目规范和参考片段
+- `read_knowledge`：根据文档 ID 和片段序号精读知识
+- `list_knowledge`：列出已索引文档，不加载正文
 - `apply_patch`：创建文件，或通过唯一的 `old_text` 精确替换文本
 - `run_command`：运行允许列表内的命令，不经过 Shell
 - `search_memory`：搜索之前需求的紧凑摘要

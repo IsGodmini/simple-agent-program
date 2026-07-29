@@ -10,17 +10,21 @@ from .files import (
     RepositoryMapTool,
     SearchCodeTool,
 )
+from .knowledge import ListKnowledgeTool, ReadKnowledgeTool, SearchKnowledgeTool
 from .memory import ReadEpisodeTool, SearchMemoryTool
 
 __all__ = [
     "ApplyPatchTool",
     "FindFilesTool",
     "ListFilesTool",
+    "ListKnowledgeTool",
     "ReadEpisodeTool",
     "ReadFileTool",
+    "ReadKnowledgeTool",
     "RepositoryMapTool",
     "RunCommandTool",
     "SearchCodeTool",
+    "SearchKnowledgeTool",
     "SearchMemoryTool",
     "Tool",
     "ToolRegistry",

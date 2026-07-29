@@ -3,12 +3,13 @@
 import json
 import re
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .agent import AgentResult, ToolExecution
+from .knowledge import KnowledgeBase
 from .llm import Message
 from .memory import BuiltContext, ContextBuilder, ProjectMemoryStore, TaskSummary
 
@@ -22,6 +23,7 @@ class TaskSession:
     started_at: str
     context_messages: List[Message]
     memory_summary_ids: List[str]
+    knowledge_citations: List[str] = field(default_factory=list)
 
 
 class SessionManager:
@@ -31,9 +33,14 @@ class SessionManager:
         self,
         store: ProjectMemoryStore,
         context_builder: Optional[ContextBuilder] = None,
+        knowledge_base: Optional[KnowledgeBase] = None,
     ) -> None:
         self.store = store
-        self.context_builder = context_builder or ContextBuilder(store)
+        self.knowledge_base = knowledge_base or KnowledgeBase(store.workspace)
+        self.context_builder = context_builder or ContextBuilder(
+            store,
+            knowledge_base=self.knowledge_base,
+        )
 
     def start_task(self, request: str) -> TaskSession:
         built: BuiltContext = self.context_builder.build(request)
@@ -48,6 +55,7 @@ class SessionManager:
             started_at=now.isoformat(),
             context_messages=built.messages,
             memory_summary_ids=built.summary_ids,
+            knowledge_citations=built.knowledge_citations,
         )
 
     def complete_task(
@@ -77,6 +85,7 @@ class SessionManager:
                 "started_at": session.started_at,
                 "finished_at": finished_at,
                 "memory_summary_ids": session.memory_summary_ids,
+                "knowledge_citations": session.knowledge_citations,
                 "final_content": result.content,
                 "iterations": result.iterations,
                 "compactions": result.compactions,
@@ -115,6 +124,7 @@ class SessionManager:
                 "started_at": session.started_at,
                 "finished_at": finished_at,
                 "memory_summary_ids": session.memory_summary_ids,
+                "knowledge_citations": session.knowledge_citations,
                 "error": error_text,
             },
         )
