@@ -78,7 +78,7 @@ class FakeLLM:
         return next(self.responses)
 
 
-def orchestrator(root, llm, mode="auto", revisions=1):
+def orchestrator(root, llm, mode="auto", revisions=1, progress_callback=None):
     workspace = Workspace(root)
     read_tools = ToolRegistry([ListFilesTool(workspace)])
     return WorkflowOrchestrator(
@@ -92,6 +92,7 @@ def orchestrator(root, llm, mode="auto", revisions=1):
             mode=mode,
             max_step_revisions=revisions,
         ),
+        progress_callback=progress_callback,
     )
 
 
@@ -170,6 +171,24 @@ class TaskPlanTests(unittest.TestCase):
 
 
 class WorkflowOrchestratorTests(unittest.TestCase):
+    def test_reports_routing_execution_and_completion_progress(self):
+        with TemporaryDirectory() as directory:
+            events = []
+            llm = FakeLLM([assistant_message(content="项目包含 README。")])
+
+            orchestrator(
+                Path(directory),
+                llm,
+                mode="react",
+                progress_callback=events.append,
+            ).run("项目里有什么？")
+
+            names = [event["event"] for event in events]
+            self.assertEqual(names[0], "workflow_routed")
+            self.assertIn("execution_started", names)
+            self.assertIn("model_started", names)
+            self.assertEqual(names[-1], "workflow_completed")
+
     def test_simple_read_only_task_stays_in_react_without_reflection(self):
         with TemporaryDirectory() as directory:
             llm = FakeLLM([assistant_message(content="项目包含 README。")])

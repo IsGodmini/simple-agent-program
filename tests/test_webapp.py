@@ -10,7 +10,26 @@ from simple_agent.webapp import create_app
 
 
 class _FakeAgent:
+    def __init__(self, progress_callback=None):
+        self.progress_callback = progress_callback
+
     def run(self, request, context_messages=None):
+        if self.progress_callback:
+            self.progress_callback(
+                {
+                    "event": "workflow_routed",
+                    "mode": "plan_and_act",
+                    "message": "复杂需求进入 Plan-and-Act",
+                }
+            )
+            self.progress_callback(
+                {
+                    "event": "tool_started",
+                    "role": "executor",
+                    "tool": "read_file",
+                    "message": "正在调用工具：read_file",
+                }
+            )
         return AgentResult(
             content=f"已完成：{request}",
             iterations=2,
@@ -37,7 +56,7 @@ class _FakeAgent:
 
 
 def _fake_agent_factory(*args, **kwargs):
-    return _FakeAgent()
+    return _FakeAgent(kwargs.get("progress_callback"))
 
 
 class WebAppTests(unittest.TestCase):
@@ -161,6 +180,11 @@ class WebAppTests(unittest.TestCase):
             job["result"]["workflow"]["reviews"][0]["verdict"],
             "pass",
         )
+        progress_events = [event["event"] for event in job["progress"]]
+        self.assertIn("context_building", progress_events)
+        self.assertIn("workflow_routed", progress_events)
+        self.assertIn("tool_started", progress_events)
+        self.assertEqual(progress_events[-1], "completed")
 
         requirements = self.client.get(
             "/api/sessions/default/requirements",
@@ -176,6 +200,14 @@ class WebAppTests(unittest.TestCase):
         )
         self.assertEqual(episode.status_code, 200)
         self.assertEqual(episode.json()["status"], "completed")
+
+        result = self.client.get(
+            f"/api/requirements/{job['result']['requirement_id']}",
+            params={"workspace": str(self.workspace)},
+        )
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()["content"], "已完成：实现健康检查接口")
+        self.assertNotIn("messages", result.json())
 
     def test_rejects_invalid_mode_and_unknown_session(self):
         invalid_mode = self.client.post(

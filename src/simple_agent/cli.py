@@ -4,7 +4,7 @@ import argparse
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .config import Settings
 from .context import ContextBudget, ContextManager
@@ -37,6 +37,7 @@ def build_agent(
     memory_store: Optional[ProjectMemoryStore] = None,
     knowledge_base: Optional[KnowledgeBase] = None,
     agent_mode: Optional[str] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> WorkflowOrchestrator:
     settings = Settings.from_env()
     workspace = Workspace(workspace_path)
@@ -110,6 +111,7 @@ def build_agent(
             reviewer_iterations=settings.reviewer_max_iterations,
         ),
         context_manager=context_manager,
+        progress_callback=progress_callback,
     )
 
 

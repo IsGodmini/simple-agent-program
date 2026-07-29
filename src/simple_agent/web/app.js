@@ -166,6 +166,12 @@ function appendResultMeta(container, requirement) {
   container.append(meta);
 }
 
+function markdownBlock(content) {
+  const block = node("div", "markdown-body");
+  block.innerHTML = window.SimpleMarkdown.render(content || "");
+  return block;
+}
+
 function renderTranscript() {
   elements.transcript.replaceChildren();
   const current = state.sessions.find(
@@ -202,7 +208,11 @@ function renderTranscript() {
     );
     const agent = node("div", "agent-message");
     agent.append(node("div", "message-label", "SIMPLE AGENT"));
-    agent.append(node("p", "", requirement.summary || "需求已记录。"));
+    agent.append(
+      markdownBlock(
+        requirement.content || requirement.summary || "需求已记录。",
+      ),
+    );
     appendResultMeta(agent, requirement);
     block.append(user, agent);
     elements.transcript.append(block);
@@ -218,8 +228,14 @@ function renderTranscript() {
     const agent = node("div", "agent-message");
     agent.append(node("div", "message-label", "SIMPLE AGENT"));
     const pending = node("span", "pending-line");
+    const events = state.currentJob.progress || [];
+    const latest = events.length ? events[events.length - 1].message : "";
     pending.append(node("i"), document.createTextNode(
-      state.currentJob.status === "queued" ? "等待当前工作区任务…" : "正在理解项目并执行…",
+      latest || (
+        state.currentJob.status === "queued"
+          ? "等待当前工作区任务…"
+          : "正在理解项目并执行…"
+      ),
     ));
     agent.append(pending);
     block.append(user, agent);
@@ -264,16 +280,36 @@ function renderWorkflow(job) {
     failed: "失败",
   }[job.status] || job.status;
 
+  const progress = Array.isArray(job.progress) ? job.progress : [];
+  if (progress.length) {
+    const timelineCard = workflowCard("实时执行过程", "LIVE");
+    const timeline = node("ol", "progress-timeline");
+    const visibleEvents = progress.slice(-40);
+    visibleEvents.forEach((event, index) => {
+      const item = node("li", "progress-event");
+      if (index === visibleEvents.length - 1 && active) {
+        item.classList.add("current");
+      }
+      const marker = node("i");
+      const copy = node("div");
+      copy.append(
+        node("strong", "", event.message || event.event),
+        node(
+          "span",
+          "",
+          [event.role, event.tool, formatTime(event.timestamp)]
+            .filter(Boolean)
+            .join(" · "),
+        ),
+      );
+      item.append(marker, copy);
+      timeline.append(item);
+    });
+    timelineCard.append(timeline);
+    elements.workflowView.append(timelineCard);
+  }
+
   if (active) {
-    elements.workflowView.append(
-      workflowCard(
-        "执行模式",
-        job.agent_mode,
-        job.status === "queued"
-          ? "同一工作区中的需求会串行执行，正在等待执行槽。"
-          : "Agent 正在读取相关上下文并使用工具完成需求。",
-      ),
-    );
     return;
   }
   if (job.status === "failed") {
@@ -302,7 +338,8 @@ function renderWorkflow(job) {
     for (const step of steps) {
       list.append(node("li", "", typeof step === "string"
         ? step
-        : step.title || step.description || step.task || JSON.stringify(step)));
+        : step.objective || step.title || step.description ||
+          step.task || JSON.stringify(step)));
     }
     card.append(list);
     elements.workflowView.append(card);
@@ -368,8 +405,20 @@ async function selectSession(sessionId) {
   localStorage.setItem(`simple-agent-session:${state.workspace}`, sessionId);
   renderSessions();
   try {
-    state.requirements = await api(
+    const summaries = await api(
       `/api/sessions/${encodeURIComponent(sessionId)}/requirements?${queryWorkspace()}`,
+    );
+    state.requirements = await Promise.all(
+      summaries.map(async (summary) => {
+        try {
+          const detail = await api(
+            `/api/requirements/${encodeURIComponent(summary.task_id)}?${queryWorkspace()}`,
+          );
+          return { ...summary, ...detail };
+        } catch {
+          return summary;
+        }
+      }),
     );
     renderTranscript();
   } catch (error) {
@@ -478,12 +527,9 @@ async function pollJob(jobId) {
     renderWorkflow(job);
     if (job.status === "completed" || job.status === "failed") {
       if (job.status === "completed") {
-        state.requirements = await api(
-          `/api/sessions/${encodeURIComponent(state.currentSession)}/requirements?${queryWorkspace()}`,
-        );
         state.sessions = await api(`/api/sessions?${queryWorkspace()}`);
         renderSessions();
-        renderTranscript();
+        await selectSession(state.currentSession);
         showToast("需求执行完成。");
       } else {
         renderTranscript();

@@ -7,7 +7,8 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -51,9 +52,10 @@ class JobRecord:
     request: str
     agent_mode: str
     status: str = "queued"
+    phase: str = "queued"
+    progress: List[Dict[str, Any]] = field(default_factory=list)
     result: Optional[Dict[str, Any]] = None
     error: str = ""
-
 
 AgentFactory = Callable[..., Any]
 
@@ -94,6 +96,13 @@ class JobManager:
                 str(workspace.root),
                 threading.Lock(),
             )
+        self._record_progress(
+            job.job_id,
+            {
+                "event": "queued",
+                "message": "需求已进入当前工作区执行队列",
+            },
+        )
         self.executor.submit(self._run, job.job_id, workspace_lock)
         return self.get(job.job_id)
 
@@ -108,9 +117,22 @@ class JobManager:
         self.executor.shutdown(wait=False, cancel_futures=True)
 
     def _run(self, job_id: str, workspace_lock: threading.Lock) -> None:
-        self._update(job_id, status="running")
         try:
             with workspace_lock:
+                self._update(
+                    job_id,
+                    status="running",
+                    phase="context_building",
+                )
+                self._record_progress(
+                    job_id,
+                    {
+                        "event": "context_building",
+                        "message": (
+                            "正在构建会话摘要、场景记忆与知识库上下文"
+                        ),
+                    },
+                )
                 snapshot = self.get(job_id)
                 workspace = _workspace(snapshot["workspace"])
                 store = ProjectMemoryStore(workspace)
@@ -123,12 +145,31 @@ class JobManager:
                 requirement = session_manager.start_requirement(
                     snapshot["request"]
                 )
+                self._record_progress(
+                    job_id,
+                    {
+                        "event": "context_ready",
+                        "memory_count": len(requirement.memory_summary_ids),
+                        "knowledge_count": len(
+                            requirement.knowledge_citations
+                        ),
+                        "message": (
+                            "上下文构建完成："
+                            f"{len(requirement.memory_summary_ids)} 条记忆，"
+                            f"{len(requirement.knowledge_citations)} 条知识引用"
+                        ),
+                    },
+                )
                 try:
                     result: AgentResult = self.agent_factory(
                         workspace.root,
                         memory_store=store,
                         knowledge_base=knowledge,
                         agent_mode=snapshot["agent_mode"],
+                        progress_callback=lambda event: self._record_progress(
+                            job_id,
+                            event,
+                        ),
                     ).run(
                         snapshot["request"],
                         context_messages=requirement.context_messages,
@@ -136,6 +177,13 @@ class JobManager:
                 except Exception as exc:
                     session_manager.fail_task(requirement, exc)
                     raise
+                self._record_progress(
+                    job_id,
+                    {
+                        "event": "memory_writing",
+                        "message": "正在写入需求摘要与场景记忆",
+                    },
+                )
                 summary = session_manager.complete_task(requirement, result)
                 payload = {
                     "requirement_id": requirement.task_id,
@@ -146,11 +194,31 @@ class JobManager:
                     "iterations": result.iterations,
                     "compactions": result.compactions,
                 }
-            self._update(job_id, status="completed", result=payload)
+            self._record_progress(
+                job_id,
+                {
+                    "event": "completed",
+                    "message": "需求结果与项目记忆均已保存",
+                },
+            )
+            self._update(
+                job_id,
+                status="completed",
+                phase="completed",
+                result=payload,
+            )
         except Exception as exc:
+            self._record_progress(
+                job_id,
+                {
+                    "event": "failed",
+                    "message": f"执行失败：{type(exc).__name__}",
+                },
+            )
             self._update(
                 job_id,
                 status="failed",
+                phase="failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
 
@@ -159,6 +227,22 @@ class JobManager:
             job = self._jobs[job_id]
             for name, value in changes.items():
                 setattr(job, name, value)
+
+    def _record_progress(
+        self,
+        job_id: str,
+        event: Dict[str, Any],
+    ) -> None:
+        record = {
+            **event,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        with self._lock:
+            job = self._jobs[job_id]
+            job.phase = str(record.get("event") or job.phase)
+            job.progress.append(record)
+            if len(job.progress) > 200:
+                job.progress = job.progress[-200:]
 
 
 def create_app(
@@ -267,6 +351,30 @@ def create_app(
             return ProjectMemoryStore(
                 _workspace(workspace)
             ).read_episode(requirement_id)
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/requirements/{requirement_id}")
+    def read_requirement_result(
+        requirement_id: str,
+        workspace: str = Query(..., min_length=1),
+    ) -> Dict[str, Any]:
+        try:
+            episode = ProjectMemoryStore(
+                _workspace(workspace)
+            ).read_episode(requirement_id)
+            return {
+                "requirement_id": requirement_id,
+                "status": episode.get("status", ""),
+                "content": (
+                    episode.get("final_content")
+                    or episode.get("error")
+                    or ""
+                ),
+                "workflow": episode.get("workflow"),
+                "iterations": episode.get("iterations", 0),
+                "compactions": episode.get("compactions", 0),
+            }
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

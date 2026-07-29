@@ -56,6 +56,39 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(second_request[-1]["role"], "tool")
             self.assertIn("README.md", second_request[-1]["content"])
 
+    def test_agent_reports_model_and_tool_progress(self):
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            llm = FakeLLM(
+                [
+                    assistant_message(
+                        tool_calls=[tool_call("call-1", "list_files", {})]
+                    ),
+                    assistant_message(content="完成"),
+                ]
+            )
+            events = []
+
+            Agent(
+                llm,
+                registry,
+                progress_callback=events.append,
+                progress_role="executor",
+            ).run("查看项目")
+
+            self.assertEqual(
+                [event["event"] for event in events],
+                [
+                    "model_started",
+                    "tool_started",
+                    "tool_completed",
+                    "model_started",
+                    "agent_completed",
+                ],
+            )
+            self.assertEqual(events[1]["tool"], "list_files")
+            self.assertNotIn("arguments", events[1])
+
     def test_empty_request_is_rejected(self):
         with TemporaryDirectory() as directory:
             registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])

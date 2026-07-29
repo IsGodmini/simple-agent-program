@@ -3,7 +3,7 @@
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .agent import Agent, AgentResult, ToolExecution
 from .context import ContextManager
@@ -360,6 +360,7 @@ class PlannerAgent:
         tools: ToolRegistry,
         config: WorkflowConfig,
         context_manager: Optional[ContextManager],
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.agent = Agent(
             llm,
@@ -367,6 +368,8 @@ class PlannerAgent:
             max_iterations=config.planner_iterations,
             system_prompt=PLANNER_PROMPT,
             context_manager=context_manager,
+            progress_callback=progress_callback,
+            progress_role="planner",
         )
         self.max_steps = config.max_plan_steps
 
@@ -392,6 +395,7 @@ class ReflectionAgent:
         tools: ToolRegistry,
         config: WorkflowConfig,
         context_manager: Optional[ContextManager],
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.agent = Agent(
             llm,
@@ -399,6 +403,8 @@ class ReflectionAgent:
             max_iterations=config.reviewer_iterations,
             system_prompt=REVIEWER_PROMPT,
             context_manager=context_manager,
+            progress_callback=progress_callback,
+            progress_role="reviewer",
         )
 
     def review(
@@ -425,24 +431,28 @@ class WorkflowOrchestrator:
         review_tools: ToolRegistry,
         config: Optional[WorkflowConfig] = None,
         context_manager: Optional[ContextManager] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.llm = llm
         self.executor_tools = executor_tools
         self.tools = executor_tools
         self.config = config or WorkflowConfig()
         self.context_manager = context_manager
+        self.progress_callback = progress_callback
         self.router = ComplexityRouter(self.config.complexity_threshold)
         self.planner = PlannerAgent(
             llm,
             planning_tools,
             self.config,
             context_manager,
+            progress_callback,
         )
         self.reviewer = ReflectionAgent(
             llm,
             review_tools,
             self.config,
             context_manager,
+            progress_callback,
         )
 
     def run(
@@ -454,6 +464,17 @@ class WorkflowOrchestrator:
             raise ValueError("user request cannot be empty")
         context = list(context_messages or [])
         assessment = self.router.assess(user_request, self.config.mode)
+        self._emit(
+            "workflow_routed",
+            mode=assessment.mode,
+            score=assessment.score,
+            reasons=assessment.reasons,
+            message=(
+                "复杂需求进入 Plan-and-Act"
+                if assessment.mode == "plan_and_act"
+                else "需求进入 ReAct 执行"
+            ),
+        )
         self._workflow_state: Dict[str, Any] = {
             "mode": assessment.mode,
             "assessment": asdict(assessment),
@@ -473,6 +494,10 @@ class WorkflowOrchestrator:
         context: Sequence[Message],
         assessment: ComplexityAssessment,
     ) -> AgentResult:
+        self._emit(
+            "execution_started",
+            message="Executor 正在理解项目并执行需求",
+        )
         execution = self._execute(request, context)
         escalation = _plan_escalation(execution.content)
         runtime_reasons = _runtime_complexity_reasons(execution)
@@ -533,6 +558,7 @@ class WorkflowOrchestrator:
             "assessment": asdict(assessment),
             "reviews": [asdict(review) for review in reviews],
         }
+        self._emit("workflow_completed", message="需求执行与评审已完成")
         return result
 
     def _run_plan(
@@ -543,9 +569,22 @@ class WorkflowOrchestrator:
         prior_results: Optional[List[AgentResult]] = None,
         planning_request: Optional[str] = None,
     ) -> AgentResult:
+        self._emit("planning_started", message="Planner 正在调查项目并制定计划")
         plan, planning_result = self.planner.create(
             planning_request or request,
             context,
+        )
+        self._emit(
+            "plan_created",
+            goal=plan.goal,
+            steps=[
+                {
+                    "step_id": step.step_id,
+                    "objective": step.objective,
+                }
+                for step in plan.ordered_steps()
+            ],
+            message=f"计划已生成，共 {len(plan.steps)} 个步骤",
         )
         self._workflow_state.update(
             {
@@ -561,8 +600,20 @@ class WorkflowOrchestrator:
         step_records = []
         completed_summaries: List[Dict[str, str]] = []
 
-        for step in plan.ordered_steps():
+        ordered_steps = plan.ordered_steps()
+        for step_index, step in enumerate(ordered_steps, start=1):
             step.status = "running"
+            self._emit(
+                "step_started",
+                step_id=step.step_id,
+                objective=step.objective,
+                step_index=step_index,
+                step_count=len(ordered_steps),
+                message=(
+                    f"正在执行步骤 {step_index}/{len(ordered_steps)}："
+                    f"{step.objective}"
+                ),
+            )
             self._workflow_state["plan"] = _plan_dict(plan)
             step_request = self._step_request(
                 request,
@@ -587,6 +638,14 @@ class WorkflowOrchestrator:
                 for review in step_reviews
             )
             step.status = "completed"
+            self._emit(
+                "step_completed",
+                step_id=step.step_id,
+                objective=step.objective,
+                step_index=step_index,
+                step_count=len(ordered_steps),
+                message=f"步骤已完成：{step.objective}",
+            )
             completed_summaries.append(
                 {
                     "step_id": step.step_id,
@@ -624,9 +683,20 @@ class WorkflowOrchestrator:
                 ]
             ),
         }
+        self._emit(
+            "review_started",
+            scope="final",
+            message="Reflection 正在进行最终验收",
+        )
         final_review, final_review_result = self.reviewer.review(
             final_review_request,
             context,
+        )
+        self._emit(
+            "review_completed",
+            scope="final",
+            verdict=final_review.verdict,
+            message=f"最终评审结论：{final_review.verdict}",
         )
         all_results.append(final_review_result)
         reviews.append({"scope": "final", **asdict(final_review)})
@@ -665,6 +735,10 @@ class WorkflowOrchestrator:
                 final_review.summary or "final review blocked completion"
             )
 
+        self._emit(
+            "synthesis_started",
+            message="正在整理执行结果并生成最终回复",
+        )
         final_content = self._synthesize(
             request,
             plan,
@@ -679,6 +753,7 @@ class WorkflowOrchestrator:
             "steps": step_records,
             "reviews": reviews,
         }
+        self._emit("workflow_completed", message="计划、执行与评审已全部完成")
         return result
 
     def _execute(
@@ -692,6 +767,8 @@ class WorkflowOrchestrator:
             max_iterations=self.config.executor_iterations,
             system_prompt=EXECUTOR_PROMPT,
             context_manager=self.context_manager,
+            progress_callback=self.progress_callback,
+            progress_role="executor",
         ).run(request, context_messages=context)
 
     def _review_and_revise(
@@ -705,8 +782,15 @@ class WorkflowOrchestrator:
         extra_results = []
         current = execution
         for revision in range(self.config.max_step_revisions + 1):
+            scope = step.step_id if step else "complete-react-task"
+            self._emit(
+                "review_started",
+                scope=scope,
+                revision=revision,
+                message="Reflection 正在根据代码与验证证据进行评审",
+            )
             review_request = {
-                "scope": step.step_id if step else "complete-react-task",
+                "scope": scope,
                 "original_request": original_request,
                 "step": asdict(step) if step else None,
                 "execution_result": current.content[:4_000],
@@ -718,6 +802,13 @@ class WorkflowOrchestrator:
             )
             reviews.append(review)
             extra_results.append(review_agent_result)
+            self._emit(
+                "review_completed",
+                scope=scope,
+                revision=revision,
+                verdict=review.verdict,
+                message=f"Reflection 评审结论：{review.verdict}",
+            )
             if review.verdict == "pass":
                 return current, reviews, extra_results
             if review.verdict == "blocked":
@@ -729,12 +820,26 @@ class WorkflowOrchestrator:
                     review.summary
                     or "review still requires changes after revision limit"
                 )
+            self._emit(
+                "repair_started",
+                scope=scope,
+                revision=revision + 1,
+                message="评审要求修订，Executor 正在修复问题",
+            )
             current = self._execute(
                 self._repair_request(original_request, step, review),
                 context,
             )
             extra_results.append(current)
         raise WorkflowBlockedError("unreachable review state")
+
+    def _emit(self, event: str, **details: Any) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback({"event": event, **details})
+        except Exception:
+            return
 
     def _synthesize(
         self,

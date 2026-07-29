@@ -1,7 +1,7 @@
 """Tool-using agent loop."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .context import ContextManager
 from .llm import ChatModel, Message
@@ -41,6 +41,8 @@ class Agent:
         max_iterations: int = 12,
         system_prompt: str = SYSTEM_PROMPT,
         context_manager: Optional[ContextManager] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_role: str = "executor",
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
@@ -49,6 +51,8 @@ class Agent:
         self.max_iterations = max_iterations
         self.system_prompt = system_prompt
         self.context_manager = context_manager
+        self.progress_callback = progress_callback
+        self.progress_role = progress_role
 
     def run(
         self,
@@ -67,6 +71,11 @@ class Agent:
         compactions = 0
 
         for iteration in range(1, self.max_iterations + 1):
+            self._emit(
+                "model_started",
+                iteration=iteration,
+                message=f"{self.progress_role} 正在分析并决定下一步",
+            )
             if self.context_manager:
                 prepared = self.context_manager.prepare(
                     messages,
@@ -74,15 +83,34 @@ class Agent:
                 )
                 messages = prepared.messages
                 compactions += prepared.removed_blocks
+                if prepared.removed_blocks:
+                    self._emit(
+                        "context_compacted",
+                        iteration=iteration,
+                        removed_blocks=prepared.removed_blocks,
+                        message="已压缩较早的工具交互以控制上下文长度",
+                    )
             assistant = self.llm.complete(messages, self.tools.definitions)
             messages.append(self._assistant_message(assistant))
 
             tool_calls = getattr(assistant, "tool_calls", None) or []
             if tool_calls:
                 for tool_call in tool_calls:
+                    self._emit(
+                        "tool_started",
+                        iteration=iteration,
+                        tool=tool_call.function.name,
+                        message=f"正在调用工具：{tool_call.function.name}",
+                    )
                     result = self.tools.execute(
                         tool_call.function.name,
                         tool_call.function.arguments,
+                    )
+                    self._emit(
+                        "tool_completed",
+                        iteration=iteration,
+                        tool=tool_call.function.name,
+                        message=f"工具执行完成：{tool_call.function.name}",
                     )
                     tool_executions.append(
                         ToolExecution(
@@ -103,6 +131,11 @@ class Agent:
 
             content = getattr(assistant, "content", None)
             if content:
+                self._emit(
+                    "agent_completed",
+                    iteration=iteration,
+                    message=f"{self.progress_role} 已完成当前任务",
+                )
                 return AgentResult(
                     content=content,
                     iterations=iteration,
@@ -115,6 +148,20 @@ class Agent:
         raise RuntimeError(
             f"Agent exceeded the maximum of {self.max_iterations} iterations"
         )
+
+    def _emit(self, event: str, **details: Any) -> None:
+        if self.progress_callback is None:
+            return
+        payload = {
+            "event": event,
+            "role": self.progress_role,
+            **details,
+        }
+        try:
+            self.progress_callback(payload)
+        except Exception:
+            # Progress reporting must never interrupt the actual agent.
+            return
 
     @staticmethod
     def _assistant_message(assistant: Any) -> Dict[str, Any]:
