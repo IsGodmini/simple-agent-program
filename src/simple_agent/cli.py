@@ -11,21 +11,29 @@ from .context import ContextBudget, ContextManager
 from .knowledge import KnowledgeBase, document_to_dict, is_supported_document
 from .llm import OpenAICompatibleLLM
 from .memory import ProjectMemoryStore
+from .project_index import ProjectIndex
 from .session import SessionManager, write_trace
 from .tools import (
     ApplyPatchTool,
+    DependencyGraphTool,
     FindFilesTool,
+    FindReferencesTool,
+    IndexStatusTool,
     ListFilesTool,
     ListKnowledgeTool,
     ReadEpisodeTool,
     ReadFileTool,
     ReadKnowledgeTool,
     ReadOnlyCommandTool,
+    ProjectOverviewTool,
+    QueryProjectIndexTool,
+    RefreshProjectIndexTool,
     RepositoryMapTool,
     RunCommandTool,
     SearchCodeTool,
     SearchKnowledgeTool,
     SearchMemoryTool,
+    SearchSymbolsTool,
     ToolRegistry,
 )
 from .workspace import Workspace
@@ -38,19 +46,34 @@ def build_agent(
     knowledge_base: Optional[KnowledgeBase] = None,
     agent_mode: Optional[str] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    project_index: Optional[ProjectIndex] = None,
 ) -> WorkflowOrchestrator:
     settings = Settings.from_env()
     workspace = Workspace(workspace_path)
     memory_store = memory_store or ProjectMemoryStore(workspace)
     knowledge_base = knowledge_base or KnowledgeBase(workspace)
+    project_index = project_index or ProjectIndex(workspace)
+    project_query_tools = [
+        ProjectOverviewTool(project_index),
+        QueryProjectIndexTool(project_index),
+        SearchSymbolsTool(project_index),
+        FindReferencesTool(project_index),
+        DependencyGraphTool(project_index),
+        IndexStatusTool(project_index),
+    ]
     executor_tools = ToolRegistry(
         [
+            *project_query_tools,
+            RefreshProjectIndexTool(project_index),
             ListFilesTool(workspace),
             FindFilesTool(workspace),
             SearchCodeTool(workspace),
             RepositoryMapTool(workspace),
             ReadFileTool(workspace),
-            ApplyPatchTool(workspace),
+            ApplyPatchTool(
+                workspace,
+                on_change=lambda path: project_index.refresh([path]),
+            ),
             RunCommandTool(workspace),
             SearchKnowledgeTool(knowledge_base),
             ReadKnowledgeTool(knowledge_base),
@@ -61,6 +84,7 @@ def build_agent(
     )
     planning_tools = ToolRegistry(
         [
+            *project_query_tools,
             ListFilesTool(workspace),
             FindFilesTool(workspace),
             SearchCodeTool(workspace),
@@ -75,6 +99,7 @@ def build_agent(
     )
     review_tools = ToolRegistry(
         [
+            *project_query_tools,
             ListFilesTool(workspace),
             FindFilesTool(workspace),
             SearchCodeTool(workspace),
@@ -184,6 +209,16 @@ def parse_args() -> argparse.Namespace:
         metavar="DOCUMENT_ID",
         help="Remove an indexed document by ID; may be repeated.",
     )
+    parser.add_argument(
+        "--refresh-index",
+        action="store_true",
+        help="Incrementally refresh the persistent project source index.",
+    )
+    parser.add_argument(
+        "--index-status",
+        action="store_true",
+        help="Show persistent project index status without calling the LLM.",
+    )
     return parser.parse_args()
 
 
@@ -192,12 +227,16 @@ def main() -> None:
     workspace = Workspace(args.workspace)
     memory_store = ProjectMemoryStore(workspace)
     knowledge_base = KnowledgeBase(workspace)
+    project_index = ProjectIndex(workspace)
     session_id, session_output = _handle_session_actions(args, memory_store)
     if session_output:
         print(session_output)
     knowledge_output = _handle_knowledge_actions(args, knowledge_base)
     if knowledge_output:
         print(knowledge_output)
+    index_output = _handle_index_actions(args, project_index)
+    if index_output:
+        print(index_output)
 
     request = " ".join(args.request).strip()
     if not request:
@@ -208,6 +247,8 @@ def main() -> None:
             or args.remove_knowledge
             or args.new_session
             or args.list_sessions
+            or args.refresh_index
+            or args.index_status
         ):
             return
         raise ValueError(
@@ -217,6 +258,7 @@ def main() -> None:
     session_manager = SessionManager(
         memory_store,
         knowledge_base=knowledge_base,
+        project_index=project_index,
         session_id=session_id,
     )
     task = session_manager.start_task(request)
@@ -225,6 +267,7 @@ def main() -> None:
             args.workspace,
             memory_store=memory_store,
             knowledge_base=knowledge_base,
+            project_index=project_index,
             agent_mode=args.agent_mode,
         ).run(
             request,
@@ -243,6 +286,32 @@ def main() -> None:
             requirement_id=task.task_id,
         )
     print(result.content)
+
+
+def _handle_index_actions(
+    args: argparse.Namespace,
+    project_index: ProjectIndex,
+) -> str:
+    output = []
+    if args.refresh_index:
+        output.append(
+            "项目索引已增量刷新：\n"
+            + json.dumps(
+                asdict(project_index.refresh()),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    if args.index_status:
+        output.append(
+            "项目索引状态：\n"
+            + json.dumps(
+                project_index.status(),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    return "\n".join(output)
 
 
 def _handle_session_actions(

@@ -1,6 +1,6 @@
 """Controlled text-file editing tool."""
 
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional
 
 from ..workspace import Workspace
 from .base import Tool
@@ -41,8 +41,13 @@ class ApplyPatchTool(Tool):
         "additionalProperties": False,
     }
 
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        on_change: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self.workspace = workspace
+        self.on_change = on_change
 
     def execute(self, arguments: Dict[str, Any]) -> str:
         relative_path = arguments.get("path")
@@ -65,6 +70,7 @@ class ApplyPatchTool(Tool):
                 raise ValueError(f"file already exists: {relative_path}")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(new_text, encoding="utf-8")
+            self._notify_change(relative_path)
             return f"Created {relative_path} ({len(new_text)} characters)"
 
         if not isinstance(old_text, str) or not old_text:
@@ -83,7 +89,17 @@ class ApplyPatchTool(Tool):
 
         updated = content.replace(old_text, new_text, 1)
         path.write_text(updated, encoding="utf-8")
+        self._notify_change(relative_path)
         return (
             f"Updated {relative_path}: replaced {len(old_text)} characters "
             f"with {len(new_text)} characters"
         )
+
+    def _notify_change(self, relative_path: str) -> None:
+        if self.on_change is not None:
+            try:
+                self.on_change(relative_path)
+            except Exception:
+                # The source edit is already durable; index refresh can retry
+                # automatically at the beginning of the next requirement.
+                return

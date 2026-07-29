@@ -6,6 +6,7 @@ const state = {
   currentSession: "",
   requirements: [],
   knowledge: [],
+  projectIndex: null,
   currentJob: null,
   polling: false,
 };
@@ -75,6 +76,15 @@ function setConnected(connected) {
   elements.sendButton.disabled = !connected || state.polling;
   elements.newSessionButton.disabled = !connected;
   elements.uploadButton.disabled = !connected;
+}
+
+function updateMemoryStatus() {
+  const indexed = state.projectIndex && state.projectIndex.ready
+    ? `${state.projectIndex.indexed_files} 索引文件`
+    : "索引待初始化";
+  elements.memoryStatus.textContent = (
+    `${state.sessions.length} 会话 · ${state.knowledge.length} 资料 · ${indexed}`
+  );
 }
 
 function formatTime(value) {
@@ -226,10 +236,43 @@ function renderTranscript() {
       node("div", "user-message", state.currentJob.request),
     );
     const agent = node("div", "agent-message");
-    agent.append(node("div", "message-label", "SIMPLE AGENT"));
-    const pending = node("span", "pending-line");
+    agent.append(node("div", "message-label", "SIMPLE AGENT · CURRENT ACTION"));
     const events = state.currentJob.progress || [];
-    const latest = events.length ? events[events.length - 1].message : "";
+    const intents = events.filter(
+      (event) => event.event === "model_intent" && event.intent,
+    );
+    const intentPanel = node("div", "intent-panel");
+    const intentHeading = node("div", "intent-heading");
+    intentHeading.append(node("i"), node("strong", "", "模型行动说明"));
+    const intentList = node("div", "intent-list");
+    if (intents.length) {
+      for (const event of intents.slice(-6)) {
+        const item = node("div", "intent-item");
+        const role = {
+          planner: "Planner",
+          executor: "Executor",
+          reviewer: "Reflection",
+        }[event.role] || "Agent";
+        item.append(
+          node("span", "", role),
+          node("p", "", event.intent),
+        );
+        intentList.append(item);
+      }
+    } else {
+      intentList.append(
+        node("p", "intent-placeholder", "模型正在理解需求并准备下一步行动…"),
+      );
+    }
+    intentPanel.append(intentHeading, intentList);
+    agent.append(intentPanel);
+    const pending = node("span", "pending-line");
+    const operationalEvents = events.filter(
+      (event) => event.event !== "model_intent",
+    );
+    const latest = operationalEvents.length
+      ? operationalEvents[operationalEvents.length - 1].message
+      : "";
     pending.append(node("i"), document.createTextNode(
       latest || (
         state.currentJob.status === "queued"
@@ -280,7 +323,9 @@ function renderWorkflow(job) {
     failed: "失败",
   }[job.status] || job.status;
 
-  const progress = Array.isArray(job.progress) ? job.progress : [];
+  const progress = Array.isArray(job.progress)
+    ? job.progress.filter((event) => event.event !== "model_intent")
+    : [];
   if (progress.length) {
     const timelineCard = workflowCard("实时执行过程", "LIVE");
     const timeline = node("ol", "progress-timeline");
@@ -392,6 +437,7 @@ async function connectWorkspace(path) {
     state.workspace = overview.path;
     state.sessions = overview.sessions;
     state.knowledge = overview.knowledge;
+    state.projectIndex = overview.project_index;
     state.currentJob = null;
     localStorage.setItem("simple-agent-workspace", state.workspace);
     elements.workspacePath.value = state.workspace;
@@ -404,7 +450,7 @@ async function connectWorkspace(path) {
     renderKnowledge();
     renderWorkflow(null);
     await selectSession(selected);
-    elements.memoryStatus.textContent = `${state.sessions.length} 会话 · ${state.knowledge.length} 资料`;
+    updateMemoryStatus();
     setConnected(true);
   } catch (error) {
     showToast(error.message, true);
@@ -456,7 +502,7 @@ async function createSession(event) {
     elements.sessionDialog.close();
     elements.sessionName.value = "";
     await selectSession(session.session_id);
-    elements.memoryStatus.textContent = `${state.sessions.length} 会话 · ${state.knowledge.length} 资料`;
+    updateMemoryStatus();
     showToast("会话已创建。");
   } catch (error) {
     showToast(error.message, true);
@@ -476,7 +522,7 @@ async function uploadKnowledge() {
     });
     state.knowledge = await api(`/api/knowledge?${queryWorkspace()}`);
     renderKnowledge();
-    elements.memoryStatus.textContent = `${state.sessions.length} 会话 · ${state.knowledge.length} 资料`;
+    updateMemoryStatus();
     showToast(`已导入 ${files.length} 个知识文件。`);
   } catch (error) {
     showToast(error.message, true);
@@ -497,7 +543,7 @@ async function removeKnowledge(document) {
       (item) => item.document_id !== document.document_id,
     );
     renderKnowledge();
-    elements.memoryStatus.textContent = `${state.sessions.length} 会话 · ${state.knowledge.length} 资料`;
+    updateMemoryStatus();
     showToast("知识文件已删除。");
   } catch (error) {
     showToast(error.message, true);
@@ -544,8 +590,12 @@ async function pollJob(jobId) {
     if (job.status === "completed" || job.status === "failed") {
       if (job.status === "completed") {
         state.sessions = await api(`/api/sessions?${queryWorkspace()}`);
+        state.projectIndex = await api(
+          `/api/project-index?${queryWorkspace()}`,
+        );
         renderSessions();
         await selectSession(state.currentSession);
+        updateMemoryStatus();
         showToast("需求执行完成。");
       } else {
         renderTranscript();

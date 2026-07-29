@@ -41,6 +41,7 @@ class AgentTests(unittest.TestCase):
             llm = FakeLLM(
                 [
                     assistant_message(
+                        content="行动说明：先查看项目文件列表，确认需要读取的范围",
                         tool_calls=[tool_call("call-1", "list_files", {})]
                     ),
                     assistant_message(content="I found README.md."),
@@ -62,6 +63,7 @@ class AgentTests(unittest.TestCase):
             llm = FakeLLM(
                 [
                     assistant_message(
+                        content="行动说明：先查看项目文件列表，确认需要读取的范围",
                         tool_calls=[tool_call("call-1", "list_files", {})]
                     ),
                     assistant_message(content="完成"),
@@ -80,14 +82,46 @@ class AgentTests(unittest.TestCase):
                 [event["event"] for event in events],
                 [
                     "model_started",
+                    "model_intent",
                     "tool_started",
                     "tool_completed",
                     "model_started",
                     "agent_completed",
                 ],
             )
-            self.assertEqual(events[1]["tool"], "list_files")
+            self.assertEqual(
+                events[1]["intent"],
+                "先查看项目文件列表，确认需要读取的范围",
+            )
+            self.assertEqual(events[2]["tool"], "list_files")
             self.assertNotIn("arguments", events[1])
+            self.assertNotIn("arguments", events[2])
+
+    def test_non_public_tool_content_is_not_exposed_as_intent(self):
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            events = []
+            llm = FakeLLM(
+                [
+                    assistant_message(
+                        content="internal reasoning that must stay hidden",
+                        tool_calls=[tool_call("call-1", "list_files", {})],
+                    ),
+                    assistant_message(content="完成"),
+                ]
+            )
+
+            Agent(
+                llm,
+                registry,
+                progress_callback=events.append,
+            ).run("查看项目")
+
+            intent = next(
+                event for event in events if event["event"] == "model_intent"
+            )
+            self.assertNotIn("internal reasoning", intent["intent"])
+            self.assertIn("list_files", intent["intent"])
 
     def test_empty_request_is_rejected(self):
         with TemporaryDirectory() as directory:

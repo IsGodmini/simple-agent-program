@@ -30,6 +30,14 @@ class _FakeAgent:
                     "message": "正在调用工具：read_file",
                 }
             )
+            self.progress_callback(
+                {
+                    "event": "model_intent",
+                    "role": "executor",
+                    "intent": "读取健康检查相关代码并确认接口结构",
+                    "message": "读取健康检查相关代码并确认接口结构",
+                }
+            )
         return AgentResult(
             content=f"已完成：{request}",
             iterations=2,
@@ -152,6 +160,10 @@ class WebAppTests(unittest.TestCase):
         )
 
     def test_runs_requirement_and_persists_summary_and_episode(self):
+        (self.workspace / "app.py").write_text(
+            "def health_check():\n    return True\n",
+            encoding="utf-8",
+        )
         self.client.get(
             "/api/workspace",
             params={"path": str(self.workspace)},
@@ -184,6 +196,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("context_building", progress_events)
         self.assertIn("workflow_routed", progress_events)
         self.assertIn("tool_started", progress_events)
+        self.assertIn("model_intent", progress_events)
         self.assertEqual(progress_events[-1], "completed")
 
         requirements = self.client.get(
@@ -208,6 +221,14 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.json()["content"], "已完成：实现健康检查接口")
         self.assertNotIn("messages", result.json())
+
+        index = self.client.get(
+            "/api/project-index",
+            params={"workspace": str(self.workspace)},
+        )
+        self.assertEqual(index.status_code, 200)
+        self.assertTrue(index.json()["ready"])
+        self.assertEqual(index.json()["indexed_files"], 1)
 
     def test_rejects_invalid_mode_and_unknown_session(self):
         invalid_mode = self.client.post(

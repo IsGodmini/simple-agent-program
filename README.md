@@ -9,6 +9,8 @@
 - 分页列出和查找大型项目文件
 - 搜索代码、符号及调用位置
 - 生成紧凑仓库地图
+- 持久化工作区项目树、代码片段、符号和依赖关系索引
+- 每个新需求只重读发生变化的源码文件
 - 按行分段读取大型 UTF-8 文本文件
 - 创建新文件或精确替换已有文本
 - 运行受控的测试、构建和静态检查命令
@@ -63,6 +65,11 @@ simple-agent-web --workspace /path/to/project
 图片、代码块和表格。执行观察区会实时显示上下文构建、模式路由、模型调用、工具
 执行、计划步骤、Reflection 评审、结果整理和场景记忆写入过程；只展示阶段信息，
 不泄露模型隐藏推理或工具参数。
+
+需求执行期间，中间对话区会显示模型主动输出的简短公开行动说明，例如接下来要
+检查什么、修改什么或验证什么；右侧执行观察区继续显示独立的模型与工具调用链。
+只有严格使用 `行动说明：...` 协议的内容才会展示，其他内部内容会被忽略并替换成
+基于工具名称生成的安全说明。
 
 也可以指定其他项目目录：
 
@@ -168,8 +175,43 @@ simple-agent --workspace /path/to/project \
 不依赖外部 Embedding 服务。每次新需求只自动注入少量相关片段，并保留
 `knowledge:<document-id>#chunk-<n>` 引用；完整知识库不会被塞入上下文。
 
+## 增量项目索引
+
+项目首次收到需求时，会在本地构建工作区共享索引：
+
+```text
+.simple-agent/index/
+├── project-index.db
+└── repository-map.json
+```
+
+索引包含安全过滤后的文件树、语言和模块统计、清单与入口文件、代码片段全文索引、
+类和函数等符号，以及 Python、JavaScript/TypeScript、Go、Rust 的主要依赖关系。
+`.env`、私钥、Git 内部数据、虚拟环境、依赖目录和构建产物不会进入索引。
+
+后续需求仍会检查文件路径、大小和修改时间，但不会重新读取内容没有变化的源码。
+新增、修改和删除的文件会增量更新；Agent 使用 `apply_patch` 修改代码后，会立即
+刷新对应文件。索引用于定位范围，修改前仍会使用 `read_file` 核对当前真实内容。
+
+可以不调用 LLM，手动刷新或查看状态：
+
+```bash
+simple-agent --workspace /path/to/project --refresh-index
+simple-agent --workspace /path/to/project --index-status
+```
+
+同一工作区的所有会话共享一份项目索引。新需求会自动注入紧凑项目地图和少量相关
+代码片段，不会把完整项目树或全部代码加入模型上下文。
+
 ## 工具
 
+- `project_overview`：读取缓存的项目树、模块、语言、入口和索引状态
+- `query_project_index`：从持久化 FTS5 索引检索相关代码片段
+- `search_symbols`：定位类、函数、接口等声明
+- `find_references`：从缓存代码片段查找符号引用
+- `dependency_graph`：查看 import、require、use 等依赖关系
+- `index_status`：查看项目索引规模和最近刷新时间
+- `refresh_project_index`：按需增量刷新指定文件或整个索引
 - `repository_map`：统计技术栈清单、入口、扩展名和顶层模块
 - `list_files`：按深度和 offset 分页列出项目结构
 - `find_files`：使用 Glob 分页查找文件
@@ -231,10 +273,15 @@ Agent 会使用保守的 UTF-8 长度估算请求 Token。在达到压缩阈值�
 构成临时工作上下文；需求结束后，只把紧凑摘要自动提供给同一会话的后续需求，
 原始过程不会自动进入新上下文。其他会话只能按相关性获得已完成场景记忆。
 
-本地记忆结构：
+本地工作区状态结构：
 
 ```text
 .simple-agent/
+├── index/
+│   ├── project-index.db
+│   └── repository-map.json
+├── knowledge/
+│   └── knowledge.db
 ├── memory/
 │   ├── conversation_sessions.json
 │   └── task_summaries.json

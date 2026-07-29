@@ -156,6 +156,17 @@ class Agent:
 
             tool_calls = getattr(assistant, "tool_calls", None) or []
             if tool_calls:
+                intent = self._public_intent(
+                    getattr(assistant, "content", None),
+                    [call.function.name for call in tool_calls],
+                )
+                self._emit(
+                    "model_intent",
+                    iteration=iteration,
+                    intent=intent,
+                    tools=[call.function.name for call in tool_calls],
+                    message=intent,
+                )
                 new_evidence = False
                 for tool_call in tool_calls:
                     self._emit(
@@ -288,6 +299,26 @@ class Agent:
             [tool_name, normalized_arguments, result.strip()]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _public_intent(
+        self,
+        content: Any,
+        tool_names: List[str],
+    ) -> str:
+        if isinstance(content, str):
+            compact = " ".join(content.strip().split())
+            prefix = "行动说明："
+            if compact.startswith(prefix):
+                intent = compact[len(prefix) :].strip()
+                if intent:
+                    return intent[:300]
+        tools = "、".join(dict.fromkeys(tool_names))
+        role = {
+            "planner": "Planner",
+            "reviewer": "Reflection",
+            "executor": "Executor",
+        }.get(self.progress_role, self.progress_role)
+        return f"{role} 准备使用 {tools} 获取下一步所需的项目证据"
 
     def _emit(self, event: str, **details: Any) -> None:
         if self.progress_callback is None:

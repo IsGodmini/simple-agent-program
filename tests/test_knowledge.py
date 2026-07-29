@@ -340,6 +340,12 @@ class KnowledgeCliTests(unittest.TestCase):
             self.assertIn("search_knowledge", names)
             self.assertIn("read_knowledge", names)
             self.assertIn("list_knowledge", names)
+            self.assertIn("project_overview", names)
+            self.assertIn("query_project_index", names)
+            self.assertIn("search_symbols", names)
+            self.assertIn("find_references", names)
+            self.assertIn("dependency_graph", names)
+            self.assertIn("refresh_project_index", names)
             self.assertIsInstance(
                 agent.tools._tools["run_command"],
                 RunCommandTool,

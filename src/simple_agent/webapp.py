@@ -26,6 +26,7 @@ from .knowledge import (
     document_to_dict,
 )
 from .memory import ProjectMemoryStore
+from .project_index import ProjectIndex
 from .session import SessionManager
 from .workspace import Workspace
 
@@ -137,9 +138,11 @@ class JobManager:
                 workspace = _workspace(snapshot["workspace"])
                 store = ProjectMemoryStore(workspace)
                 knowledge = KnowledgeBase(workspace)
+                project_index = ProjectIndex(workspace)
                 session_manager = SessionManager(
                     store,
                     knowledge_base=knowledge,
+                    project_index=project_index,
                     session_id=snapshot["session_id"],
                 )
                 requirement = session_manager.start_requirement(
@@ -153,10 +156,15 @@ class JobManager:
                         "knowledge_count": len(
                             requirement.knowledge_citations
                         ),
+                        "project_index_count": len(
+                            requirement.project_index_citations
+                        ),
                         "message": (
                             "上下文构建完成："
                             f"{len(requirement.memory_summary_ids)} 条记忆，"
-                            f"{len(requirement.knowledge_citations)} 条知识引用"
+                            f"{len(requirement.knowledge_citations)} 条知识引用，"
+                            f"{len(requirement.project_index_citations)} "
+                            "个相关代码片段"
                         ),
                     },
                 )
@@ -165,6 +173,7 @@ class JobManager:
                         workspace.root,
                         memory_store=store,
                         knowledge_base=knowledge,
+                        project_index=project_index,
                         agent_mode=snapshot["agent_mode"],
                         progress_callback=lambda event: self._record_progress(
                             job_id,
@@ -295,6 +304,7 @@ def create_app(
             if not store.list_sessions():
                 store.ensure_session("default")
             knowledge = KnowledgeBase(workspace)
+            project_index = ProjectIndex(workspace)
             return {
                 "path": str(workspace.root),
                 "sessions": [
@@ -304,6 +314,7 @@ def create_app(
                     document_to_dict(document)
                     for document in knowledge.list_documents()
                 ],
+                "project_index": project_index.status(),
             }
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -405,6 +416,24 @@ def create_app(
                     _workspace(workspace)
                 ).list_documents()
             ]
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/project-index")
+    def project_index_status(
+        workspace: str = Query(..., min_length=1),
+    ) -> Dict[str, Any]:
+        try:
+            return ProjectIndex(_workspace(workspace)).overview()
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/project-index/refresh")
+    def refresh_project_index(
+        workspace: str = Query(..., min_length=1),
+    ) -> Dict[str, Any]:
+        try:
+            return asdict(ProjectIndex(_workspace(workspace)).refresh())
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

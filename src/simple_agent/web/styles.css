@@ -451,6 +451,66 @@ button { cursor: pointer; }
 .result-meta .failed { color: #b53728; background: rgba(255, 115, 92, 0.14); }
 .pending-line { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
 .pending-line i { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); animation: pulse 1s ease infinite; }
+.intent-panel {
+  margin-bottom: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(23, 25, 22, 0.1);
+  border-radius: 11px;
+  background: rgba(200, 255, 82, 0.08);
+}
+.intent-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border-bottom: 1px solid rgba(23, 25, 22, 0.08);
+  background: rgba(200, 255, 82, 0.16);
+}
+.intent-heading i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--mint);
+  box-shadow: 0 0 0 4px rgba(51, 214, 166, 0.13);
+  animation: pulse 1.2s ease infinite;
+}
+.intent-heading strong {
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+.intent-list {
+  display: grid;
+  max-height: 210px;
+  overflow-y: auto;
+}
+.intent-item {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 9px;
+  padding: 9px 11px;
+  border-bottom: 1px solid rgba(23, 25, 22, 0.065);
+}
+.intent-item:last-child { border-bottom: 0; }
+.intent-item span {
+  padding-top: 2px;
+  color: #087253;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 8px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+.intent-item p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: normal;
+}
+.intent-placeholder {
+  margin: 0;
+  padding: 12px;
+  color: var(--muted);
+  font-size: 10px;
+}
 
 .composer {
   margin: 0 24px 22px;
