@@ -1,0 +1,134 @@
+import json
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+
+from simple_agent.agent import Agent
+from simple_agent.tools import ListFilesTool, ReadFileTool, ToolRegistry
+from simple_agent.workspace import Workspace
+
+
+def assistant_message(content=None, tool_calls=None):
+    return SimpleNamespace(content=content, tool_calls=tool_calls)
+
+
+def tool_call(call_id, name, arguments):
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(
+            name=name,
+            arguments=json.dumps(arguments),
+        ),
+    )
+
+
+class FakeLLM:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.requests = []
+
+    def complete(self, messages, tools=None):
+        self.requests.append((list(messages), tools))
+        return next(self.responses)
+
+
+class AgentTests(unittest.TestCase):
+    def test_agent_executes_tool_and_returns_final_answer(self):
+        with TemporaryDirectory() as directory:
+            Path(directory, "README.md").write_text("hello", encoding="utf-8")
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            llm = FakeLLM(
+                [
+                    assistant_message(
+                        tool_calls=[tool_call("call-1", "list_files", {})]
+                    ),
+                    assistant_message(content="I found README.md."),
+                ]
+            )
+
+            result = Agent(llm, registry).run("What files are here?")
+
+            self.assertEqual(result.content, "I found README.md.")
+            self.assertEqual(result.iterations, 2)
+            second_request = llm.requests[1][0]
+            self.assertEqual(second_request[-1]["role"], "tool")
+            self.assertIn("README.md", second_request[-1]["content"])
+
+    def test_empty_request_is_rejected(self):
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            with self.assertRaisesRegex(ValueError, "cannot be empty"):
+                Agent(FakeLLM([]), registry).run(" ")
+
+    def test_iteration_limit_is_enforced(self):
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            repeated_call = assistant_message(
+                tool_calls=[tool_call("call-1", "list_files", {})]
+            )
+            with self.assertRaisesRegex(RuntimeError, "exceeded"):
+                Agent(FakeLLM([repeated_call]), registry, max_iterations=1).run(
+                    "Keep looking"
+                )
+
+
+class FileToolTests(unittest.TestCase):
+    def test_list_and_read_file(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text(
+                "first\nsecond\n", encoding="utf-8"
+            )
+            workspace = Workspace(root)
+
+            listing = ListFilesTool(workspace).execute({"path": "."})
+            content = ReadFileTool(workspace).execute({"path": "src/app.py"})
+
+            self.assertIn("src/app.py", listing)
+            self.assertIn("1 | first", content)
+            self.assertIn("2 | second", content)
+
+    def test_workspace_escape_is_rejected(self):
+        with TemporaryDirectory() as directory:
+            workspace = Workspace(Path(directory))
+            with self.assertRaisesRegex(ValueError, "outside the workspace"):
+                workspace.resolve("../secret.txt")
+
+    def test_sensitive_files_are_hidden_and_cannot_be_read(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text("API_KEY=secret", encoding="utf-8")
+            (root / ".env.example").write_text(
+                "API_KEY=placeholder", encoding="utf-8"
+            )
+            workspace = Workspace(root)
+            registry = ToolRegistry(
+                [ListFilesTool(workspace), ReadFileTool(workspace)]
+            )
+
+            listing = registry.execute("list_files", "{}")
+            denied = registry.execute("read_file", '{"path": ".env"}')
+            example = registry.execute(
+                "read_file", '{"path": ".env.example"}'
+            )
+
+            self.assertNotIn("\n.env\n", f"\n{listing}\n")
+            self.assertIn(".env.example", listing)
+            self.assertIn("sensitive path is denied", denied)
+            self.assertIn("placeholder", example)
+
+    def test_registry_returns_errors_to_the_model(self):
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ReadFileTool(Workspace(Path(directory)))])
+
+            invalid_json = registry.execute("read_file", "{")
+            unknown_tool = registry.execute("delete_file", "{}")
+
+            self.assertIn("Tool error", invalid_json)
+            self.assertIn("unknown tool", unknown_tool)
+
+
+if __name__ == "__main__":
+    unittest.main()
