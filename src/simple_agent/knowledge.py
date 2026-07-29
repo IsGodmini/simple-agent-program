@@ -429,14 +429,22 @@ class KnowledgeBase:
         self.chunk_chars = chunk_chars
         self.chunk_overlap = chunk_overlap
 
-    def ingest(self, source: Path) -> KnowledgeDocument:
+    def ingest(
+        self,
+        source: Path,
+        *,
+        source_name: Optional[str] = None,
+        source_identity: Optional[str] = None,
+    ) -> KnowledgeDocument:
         source = source.expanduser().resolve()
         sections = self.parser.parse(source)
         raw_hash = _hash_file(source)
-        document_id = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:16]
+        display_name = source_name or source.name
+        identity = source_identity or str(source)
+        document_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         chunks = self._make_chunks(sections)
         imported_at = datetime.now(timezone.utc).isoformat()
-        source_type = source.suffix.lower() or "[no extension]"
+        source_type = Path(display_name).suffix.lower() or "[no extension]"
 
         with self._connect() as connection:
             existing = connection.execute(
@@ -468,7 +476,7 @@ class KnowledgeBase:
                 """,
                 (
                     document_id,
-                    source.name,
+                    display_name,
                     str(source),
                     source_type,
                     raw_hash,
@@ -506,7 +514,7 @@ class KnowledgeBase:
                                 _terms(
                                     " ".join(
                                         [
-                                            source.name,
+                                            display_name,
                                             section.heading,
                                             section.location,
                                             section.text,
@@ -521,7 +529,7 @@ class KnowledgeBase:
 
         return KnowledgeDocument(
             document_id=document_id,
-            source_name=source.name,
+            source_name=display_name,
             source_type=source_type,
             content_hash=raw_hash,
             chunk_count=len(chunks),

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Simple Agent 本地项目开发客户端">
+    <title>Simple Agent</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Simple Agent 首页">
+        <span class="brand-mark">SA</span>
+        <span>
+          <strong>Simple Agent</strong>
+          <small>LOCAL DEVELOPMENT WORKSPACE</small>
+        </span>
+      </a>
+      <form id="workspace-form" class="workspace-form">
+        <label for="workspace-path">工作区</label>
+        <input id="workspace-path" name="workspace" autocomplete="off"
+          spellcheck="false" placeholder="/path/to/project" required>
+        <button class="button button-dark" type="submit">连接</button>
+      </form>
+      <span id="connection-state" class="connection-state">
+        <i></i> 本机
+      </span>
+    </header>
+
+    <main class="app-shell">
+      <aside class="sidebar panel">
+        <section class="sidebar-section session-section">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">CONVERSATIONS</span>
+              <h2>项目会话</h2>
+            </div>
+            <button id="new-session-button" class="icon-button"
+              type="button" title="创建会话" aria-label="创建会话">＋</button>
+          </div>
+          <div id="session-list" class="session-list" aria-live="polite"></div>
+        </section>
+
+        <section class="sidebar-section knowledge-section">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">SHARED CONTEXT</span>
+              <h2>知识库</h2>
+            </div>
+            <button id="upload-button" class="icon-button" type="button"
+              title="上传资料" aria-label="上传知识库文件">↑</button>
+          </div>
+          <p class="section-copy">项目规范与注意事项由工作区内所有会话共享。</p>
+          <input id="knowledge-files" type="file" multiple hidden>
+          <div id="knowledge-list" class="knowledge-list" aria-live="polite"></div>
+        </section>
+      </aside>
+
+      <section class="conversation panel">
+        <header class="conversation-header">
+          <div>
+            <span class="eyebrow">ACTIVE SESSION</span>
+            <h1 id="session-title">准备连接工作区</h1>
+          </div>
+          <span id="requirement-count" class="count-pill">0 条需求</span>
+        </header>
+
+        <div id="transcript" class="transcript" aria-live="polite">
+          <div class="empty-state">
+            <span class="empty-orbit"><i></i></span>
+            <span class="eyebrow">BUILD WITH INTENT</span>
+            <h2>描述你想完成的项目</h2>
+            <p>Agent 会理解代码、规划复杂任务、修改文件并根据测试结果反思。</p>
+          </div>
+        </div>
+
+        <form id="composer" class="composer">
+          <textarea id="request-input" rows="3"
+            placeholder="例如：为这个项目增加健康检查接口，并补充测试…"
+            aria-label="输入项目需求" required></textarea>
+          <div class="composer-footer">
+            <fieldset class="mode-switch">
+              <legend>执行模式</legend>
+              <label><input type="radio" name="agent-mode" value="auto"
+                checked><span>Auto</span></label>
+              <label><input type="radio" name="agent-mode" value="react">
+                <span>ReAct</span></label>
+              <label><input type="radio" name="agent-mode" value="plan">
+                <span>Plan</span></label>
+            </fieldset>
+            <div class="send-group">
+              <span>⌘ ↵ 提交</span>
+              <button id="send-button" class="button button-accent"
+                type="submit">开始开发 <b>↗</b></button>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <aside class="inspector panel">
+        <div class="section-heading inspector-heading">
+          <div>
+            <span class="eyebrow">RUN INSPECTOR</span>
+            <h2>执行观察</h2>
+          </div>
+          <span id="run-indicator" class="run-indicator idle">空闲</span>
+        </div>
+        <div id="workflow-view" class="workflow-view">
+          <div class="inspector-empty">
+            <div class="signal-lines"><i></i><i></i><i></i></div>
+            <p>提交需求后，这里会呈现路由判断、执行计划和 Reflection 评审结果。</p>
+          </div>
+        </div>
+        <footer class="inspector-footer">
+          <span>WORKSPACE MEMORY</span>
+          <strong id="memory-status">等待连接</strong>
+        </footer>
+      </aside>
+    </main>
+
+    <dialog id="session-dialog">
+      <form id="session-form" method="dialog">
+        <span class="eyebrow">NEW CONVERSATION</span>
+        <h2>创建项目会话</h2>
+        <p>同一会话会延续需求摘要；知识库与场景记忆在工作区内共享。</p>
+        <label for="session-name">会话名称</label>
+        <input id="session-name" maxlength="200" autocomplete="off"
+          placeholder="例如：认证模块" required>
+        <div class="dialog-actions">
+          <button id="cancel-session" class="button button-ghost"
+            type="button">取消</button>
+          <button class="button button-accent" type="submit">创建会话</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

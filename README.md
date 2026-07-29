@@ -42,6 +42,23 @@ cp .env.example .env
 simple-agent "分析这个项目当前实现了什么"
 ```
 
+### Web 客户端
+
+项目包含一个本地 Web 客户端，可以管理工作区会话、提交开发需求、观察
+Plan-and-Act / Reflection 执行过程，以及上传或删除共享知识库资料：
+
+```bash
+simple-agent-web --workspace /path/to/project
+```
+
+然后访问 [http://127.0.0.1:8765](http://127.0.0.1:8765)。也可以用
+`--port` 指定其他端口。
+
+客户端和 Agent 都只在本机运行，服务只允许绑定 `127.0.0.1` 或 `localhost`。
+任务状态在页面中实时轮询；会话、需求摘要、场景记忆和知识库仍持久化在目标项目
+的 `.simple-agent/` 目录中。为了避免多个 Agent 同时修改同一个项目，同一工作区
+提交的需求会串行执行。
+
 也可以指定其他项目目录：
 
 ```bash
@@ -217,5 +234,5 @@ Agent 会使用保守的 UTF-8 长度估算请求 Token。在达到压缩阈值�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -v
+PYTHONPATH=src python -m unittest discover -s tests -v
 ```
