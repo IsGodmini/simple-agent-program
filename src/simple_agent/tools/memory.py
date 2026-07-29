@@ -13,9 +13,9 @@ class SearchMemoryTool(Tool):
 
     name = "search_memory"
     description = (
-        "Search summaries of earlier project tasks. Use this when the current "
-        "request may depend on a past decision or change. Memory may be stale; "
-        "verify current files before editing."
+        "搜索当前工作区所有会话共享的场景记忆摘要。当前需求可能依赖其他"
+        "会话中的历史决策或修改时使用。结果包含 session_id；记忆可能过期，"
+        "修改前必须核对当前文件。"
     )
     parameters = {
         "type": "object",
@@ -30,6 +30,12 @@ class SearchMemoryTool(Tool):
                 "maximum": 10,
                 "description": "Maximum summaries to return. Defaults to 3.",
             },
+            "session_id": {
+                "type": "string",
+                "description": (
+                    "可选；只搜索指定会话。不提供时搜索整个工作区。"
+                ),
+            },
         },
         "required": ["query"],
         "additionalProperties": False,
@@ -41,12 +47,21 @@ class SearchMemoryTool(Tool):
     def execute(self, arguments: Dict[str, Any]) -> str:
         query = arguments.get("query")
         limit = arguments.get("limit", 3)
+        session_id = arguments.get("session_id")
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         if not isinstance(limit, int) or not 1 <= limit <= 10:
             raise ValueError("limit must be an integer from 1 to 10")
+        if session_id is not None:
+            if not isinstance(session_id, str) or not session_id:
+                raise ValueError("session_id must be a non-empty string")
+            self.store.get_session(session_id)
 
-        summaries = self.store.search_summaries(query, limit)
+        summaries = self.store.search_summaries(
+            query,
+            limit,
+            session_id=session_id,
+        )
         if not summaries:
             return "No matching project memories found."
         return json.dumps(
@@ -61,9 +76,9 @@ class ReadEpisodeTool(Tool):
 
     name = "read_episode"
     description = (
-        "Read the detailed episodic record for one earlier task ID returned by "
-        "project context or search_memory. This may contain old tool results, "
-        "so verify all current code and test state before relying on it."
+        "根据 search_memory 或项目上下文返回的 task_id，读取当前工作区中"
+        "任意会话的一条详细场景记忆。内容可能包含旧工具结果，使用前必须"
+        "核对当前代码和测试状态。"
     )
     parameters = {
         "type": "object",

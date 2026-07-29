@@ -15,10 +15,11 @@ from .memory import BuiltContext, ContextBuilder, ProjectMemoryStore, TaskSummar
 
 
 @dataclass
-class TaskSession:
-    """One natural-language requirement and its cross-task context."""
+class RequirementRun:
+    """One requirement inside a persistent workspace conversation session."""
 
     task_id: str
+    session_id: str
     request: str
     started_at: str
     context_messages: List[Message]
@@ -27,30 +28,37 @@ class TaskSession:
 
 
 class SessionManager:
-    """Separate per-task working context from persistent project memory."""
+    """Manage a multi-requirement conversation over shared project memory."""
 
     def __init__(
         self,
         store: ProjectMemoryStore,
         context_builder: Optional[ContextBuilder] = None,
         knowledge_base: Optional[KnowledgeBase] = None,
+        session_id: str = "default",
     ) -> None:
         self.store = store
+        self.session_id = session_id
+        self.store.ensure_session(session_id)
         self.knowledge_base = knowledge_base or KnowledgeBase(store.workspace)
         self.context_builder = context_builder or ContextBuilder(
             store,
             knowledge_base=self.knowledge_base,
         )
 
-    def start_task(self, request: str) -> TaskSession:
-        built: BuiltContext = self.context_builder.build(request)
+    def start_requirement(self, request: str) -> RequirementRun:
+        built: BuiltContext = self.context_builder.build(
+            request,
+            session_id=self.session_id,
+        )
         now = datetime.now(timezone.utc)
         task_id = (
             f"task-{now.strftime('%Y%m%dT%H%M%SZ')}-"
             f"{uuid.uuid4().hex[:8]}"
         )
-        return TaskSession(
+        return RequirementRun(
             task_id=task_id,
+            session_id=self.session_id,
             request=request,
             started_at=now.isoformat(),
             context_messages=built.messages,
@@ -58,14 +66,19 @@ class SessionManager:
             knowledge_citations=built.knowledge_citations,
         )
 
+    def start_task(self, request: str) -> RequirementRun:
+        """Backward-compatible alias for starting one requirement."""
+        return self.start_requirement(request)
+
     def complete_task(
         self,
-        session: TaskSession,
+        session: RequirementRun,
         result: AgentResult,
     ) -> TaskSummary:
         finished_at = datetime.now(timezone.utc).isoformat()
         files_changed = self._files_changed(result.tool_executions)
         validations = self._validations(result.tool_executions)
+        verification = self._verification(result, validations)
         summary = TaskSummary(
             task_id=session.task_id,
             request=session.request,
@@ -75,11 +88,15 @@ class SessionManager:
             validations=validations,
             started_at=session.started_at,
             finished_at=finished_at,
+            session_id=session.session_id,
+            verification=verification,
         )
         self.store.write_episode(
             session.task_id,
             {
                 "task_id": session.task_id,
+                "requirement_id": session.task_id,
+                "session_id": session.session_id,
                 "request": session.request,
                 "status": "completed",
                 "started_at": session.started_at,
@@ -103,9 +120,14 @@ class SessionManager:
             },
         )
         self.store.append_summary(summary)
+        self.store.append_requirement_to_session(summary)
         return summary
 
-    def fail_task(self, session: TaskSession, error: Exception) -> TaskSummary:
+    def fail_task(
+        self,
+        session: RequirementRun,
+        error: Exception,
+    ) -> TaskSummary:
         finished_at = datetime.now(timezone.utc).isoformat()
         error_text = f"{type(error).__name__}: {error}"
         summary = TaskSummary(
@@ -115,11 +137,15 @@ class SessionManager:
             summary=self.store.compact_text(error_text),
             started_at=session.started_at,
             finished_at=finished_at,
+            session_id=session.session_id,
+            verification="failed",
         )
         self.store.write_episode(
             session.task_id,
             {
                 "task_id": session.task_id,
+                "requirement_id": session.task_id,
+                "session_id": session.session_id,
                 "request": session.request,
                 "status": "failed",
                 "started_at": session.started_at,
@@ -131,7 +157,25 @@ class SessionManager:
             },
         )
         self.store.append_summary(summary)
+        self.store.append_requirement_to_session(summary)
         return summary
+
+    @staticmethod
+    def _verification(
+        result: AgentResult,
+        validations: List[Dict[str, Any]],
+    ) -> str:
+        if validations:
+            if all(item.get("exit_code") == 0 for item in validations):
+                return "verified"
+            return "failed"
+        workflow = result.workflow or {}
+        reviews = workflow.get("reviews", [])
+        if isinstance(reviews, list) and reviews:
+            last = reviews[-1]
+            if isinstance(last, dict) and last.get("verdict") == "pass":
+                return "verified"
+        return "unverified"
 
     @staticmethod
     def _files_changed(executions: List[ToolExecution]) -> List[str]:
@@ -171,10 +215,18 @@ class SessionManager:
         return arguments if isinstance(arguments, dict) else {}
 
 
-def write_trace(path: Path, user_request: str, result: AgentResult) -> None:
+def write_trace(
+    path: Path,
+    user_request: str,
+    result: AgentResult,
+    session_id: str = "",
+    requirement_id: str = "",
+) -> None:
     """Write a complete, opt-in execution trace as UTF-8 JSON."""
     trace = {
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "session_id": session_id,
+        "requirement_id": requirement_id,
         "user_request": user_request,
         "iterations": result.iterations,
         "compactions": result.compactions,
@@ -191,3 +243,7 @@ def write_trace(path: Path, user_request: str, result: AgentResult) -> None:
         json.dumps(trace, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+# Existing integrations imported TaskSession; keep it as a compatibility alias.
+TaskSession = RequirementRun

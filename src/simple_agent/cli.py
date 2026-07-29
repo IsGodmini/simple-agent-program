@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional
 
@@ -134,6 +135,25 @@ def parse_args() -> argparse.Namespace:
         help="Override AGENT_MODE for this task.",
     )
     parser.add_argument(
+        "--session",
+        metavar="SESSION_ID",
+        help="Continue an existing conversation session.",
+    )
+    parser.add_argument(
+        "--new-session",
+        action="store_true",
+        help="Create a new conversation session.",
+    )
+    parser.add_argument(
+        "--session-title",
+        help="Title used together with --new-session.",
+    )
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="List workspace conversation sessions without calling the LLM.",
+    )
+    parser.add_argument(
         "--knowledge-file",
         type=Path,
         action="append",
@@ -167,6 +187,9 @@ def main() -> None:
     workspace = Workspace(args.workspace)
     memory_store = ProjectMemoryStore(workspace)
     knowledge_base = KnowledgeBase(workspace)
+    session_id, session_output = _handle_session_actions(args, memory_store)
+    if session_output:
+        print(session_output)
     knowledge_output = _handle_knowledge_actions(args, knowledge_base)
     if knowledge_output:
         print(knowledge_output)
@@ -178,6 +201,8 @@ def main() -> None:
             or args.knowledge_dir
             or args.list_knowledge
             or args.remove_knowledge
+            or args.new_session
+            or args.list_sessions
         ):
             return
         raise ValueError(
@@ -187,6 +212,7 @@ def main() -> None:
     session_manager = SessionManager(
         memory_store,
         knowledge_base=knowledge_base,
+        session_id=session_id,
     )
     task = session_manager.start_task(request)
     try:
@@ -204,8 +230,53 @@ def main() -> None:
         raise
     session_manager.complete_task(task, result)
     if args.trace_file:
-        write_trace(args.trace_file, request, result)
+        write_trace(
+            args.trace_file,
+            request,
+            result,
+            session_id=task.session_id,
+            requirement_id=task.task_id,
+        )
     print(result.content)
+
+
+def _handle_session_actions(
+    args: argparse.Namespace,
+    memory_store: ProjectMemoryStore,
+) -> tuple:
+    if args.new_session and args.session:
+        raise ValueError("--new-session and --session cannot be used together")
+    if args.session_title and not args.new_session:
+        raise ValueError("--session-title requires --new-session")
+
+    output: List[str] = []
+    if args.new_session:
+        session = memory_store.create_session(title=args.session_title or "")
+        session_id = session.session_id
+        output.append(
+            "已创建会话：\n"
+            + json.dumps(asdict(session), ensure_ascii=False, indent=2)
+        )
+    elif args.session:
+        session = memory_store.get_session(args.session)
+        assert session is not None
+        session_id = session.session_id
+    else:
+        session_id = "default"
+
+    if args.list_sessions:
+        output.append(
+            "当前工作区会话：\n"
+            + json.dumps(
+                [
+                    asdict(session)
+                    for session in memory_store.list_sessions()
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    return session_id, "\n".join(output)
 
 
 def _handle_knowledge_actions(

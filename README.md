@@ -71,6 +71,32 @@ Plan-and-Act 升级。编排器不允许子 Agent 继续递归创建 Agent。
 
 计划步骤、实际工具证据、评审结论和修订次数会写入 Episode 与可选 trace。
 
+## 工作区与会话
+
+一个工作区可以包含多个会话，每个会话可以连续提交多个需求。不指定会话时，
+命令兼容地使用该工作区的 `default` 会话。
+
+```bash
+# 创建会话；输出中会包含 session_id
+simple-agent --workspace /path/to/project \
+  --new-session --session-title "认证模块"
+
+# 在指定会话中执行多个连续需求
+simple-agent --workspace /path/to/project \
+  --session <session-id> "实现登录接口"
+simple-agent --workspace /path/to/project \
+  --session <session-id> "增加登录失败次数限制"
+
+# 查看工作区中的所有会话
+simple-agent --workspace /path/to/project --list-sessions
+```
+
+同一会话会自动延续会话摘要和最近需求摘要，但不会重放旧需求的原始工具对话。
+同一工作区的不同会话共享知识库和场景记忆；其他会话的场景记忆只有与当前需求
+至少存在两个检索词项重合且状态为 `completed` 时才会自动注入。失败 Episode
+仍会保存，也可以显式使用 `search_memory` / `read_episode` 查看，但不会自动
+进入其他会话。
+
 保存完整执行日志：
 
 ```bash
@@ -166,21 +192,24 @@ Agent 会使用保守的 UTF-8 长度估算请求 Token。在达到压缩阈值�
 ## 跨需求记忆
 
 每次 CLI 调用被视为一个独立需求。需求内部的模型消息、工具调用和工具结果
-构成临时工作上下文；需求结束后，只把紧凑摘要自动提供给后续需求，原始过程
-不会自动进入新上下文。
+构成临时工作上下文；需求结束后，只把紧凑摘要自动提供给同一会话的后续需求，
+原始过程不会自动进入新上下文。其他会话只能按相关性获得已完成场景记忆。
 
 本地记忆结构：
 
 ```text
 .simple-agent/
 ├── memory/
+│   ├── conversation_sessions.json
 │   └── task_summaries.json
 └── episodes/
     └── <task-id>.json
 ```
 
-`task_summaries.json` 记录需求、结果、修改文件和验证命令。Episode 保存完整
-消息和工具执行过程，只能通过 `search_memory` / `read_episode` 按需访问。
+`conversation_sessions.json` 记录会话标题、会话摘要和需求 ID；
+`task_summaries.json` 记录每条需求所属的 `session_id`、结果、可信度、修改文件
+和验证命令。Episode 保存完整消息和工具执行过程，只能通过
+`search_memory` / `read_episode` 按需访问。
 `.simple-agent` 已被 Git 和普通文件工具忽略。
 
 记忆可能落后于当前代码，因此 Agent 会把当前文件和测试结果作为最终事实来源。
