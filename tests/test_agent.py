@@ -51,6 +51,7 @@ class AgentTests(unittest.TestCase):
 
             self.assertEqual(result.content, "I found README.md.")
             self.assertEqual(result.iterations, 2)
+            self.assertEqual(result.tool_executions[0].name, "list_files")
             second_request = llm.requests[1][0]
             self.assertEqual(second_request[-1]["role"], "tool")
             self.assertIn("README.md", second_request[-1]["content"])

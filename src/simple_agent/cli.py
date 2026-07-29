@@ -5,8 +5,16 @@ from pathlib import Path
 
 from .agent import Agent
 from .config import Settings
+from .context import ContextBudget, ContextManager
 from .llm import OpenAICompatibleLLM
-from .tools import ListFilesTool, ReadFileTool, ToolRegistry
+from .session import write_trace
+from .tools import (
+    ApplyPatchTool,
+    ListFilesTool,
+    ReadFileTool,
+    RunCommandTool,
+    ToolRegistry,
+)
 from .workspace import Workspace
 
 
@@ -17,12 +25,22 @@ def build_agent(workspace_path: Path) -> Agent:
         [
             ListFilesTool(workspace),
             ReadFileTool(workspace),
+            ApplyPatchTool(workspace),
+            RunCommandTool(workspace),
         ]
     )
     return Agent(
         llm=OpenAICompatibleLLM(settings),
         tools=tools,
         max_iterations=settings.max_iterations,
+        context_manager=ContextManager(
+            ContextBudget(
+                context_window=settings.context_window,
+                max_input_tokens=settings.max_input_tokens,
+                max_output_tokens=settings.max_output_tokens,
+                compact_at_tokens=settings.compact_at_tokens,
+            )
+        ),
     )
 
 
@@ -37,10 +55,18 @@ def parse_args() -> argparse.Namespace:
         default=Path.cwd(),
         help="Project directory (default: current directory)",
     )
+    parser.add_argument(
+        "--trace-file",
+        type=Path,
+        help="Optionally save the complete execution trace as JSON.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    result = build_agent(args.workspace).run(" ".join(args.request))
+    request = " ".join(args.request)
+    result = build_agent(args.workspace).run(request)
+    if args.trace_file:
+        write_trace(args.trace_file, request, result)
     print(result.content)

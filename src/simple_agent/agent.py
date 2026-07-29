@@ -1,11 +1,22 @@
 """Tool-using agent loop."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from .context import ContextManager
 from .llm import ChatModel, Message
 from .prompts import SYSTEM_PROMPT
 from .tools import ToolRegistry
+
+
+@dataclass
+class ToolExecution:
+    """One local tool invocation performed for the model."""
+
+    tool_call_id: str
+    name: str
+    arguments: str
+    result: str
 
 
 @dataclass
@@ -15,6 +26,8 @@ class AgentResult:
     content: str
     iterations: int
     messages: List[Message]
+    tool_executions: List[ToolExecution]
+    compactions: int = 0
 
 
 class Agent:
@@ -26,6 +39,7 @@ class Agent:
         tools: ToolRegistry,
         max_iterations: int = 12,
         system_prompt: str = SYSTEM_PROMPT,
+        context_manager: Optional[ContextManager] = None,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
@@ -33,6 +47,7 @@ class Agent:
         self.tools = tools
         self.max_iterations = max_iterations
         self.system_prompt = system_prompt
+        self.context_manager = context_manager
 
     def run(self, user_request: str) -> AgentResult:
         if not user_request.strip():
@@ -42,8 +57,17 @@ class Agent:
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_request},
         ]
+        tool_executions: List[ToolExecution] = []
+        compactions = 0
 
         for iteration in range(1, self.max_iterations + 1):
+            if self.context_manager:
+                prepared = self.context_manager.prepare(
+                    messages,
+                    self.tools.definitions,
+                )
+                messages = prepared.messages
+                compactions += prepared.removed_blocks
             assistant = self.llm.complete(messages, self.tools.definitions)
             messages.append(self._assistant_message(assistant))
 
@@ -53,6 +77,14 @@ class Agent:
                     result = self.tools.execute(
                         tool_call.function.name,
                         tool_call.function.arguments,
+                    )
+                    tool_executions.append(
+                        ToolExecution(
+                            tool_call_id=tool_call.id,
+                            name=tool_call.function.name,
+                            arguments=tool_call.function.arguments,
+                            result=result,
+                        )
                     )
                     messages.append(
                         {
@@ -69,6 +101,8 @@ class Agent:
                     content=content,
                     iterations=iteration,
                     messages=messages,
+                    tool_executions=tool_executions,
+                    compactions=compactions,
                 )
             raise RuntimeError("Model returned neither content nor tool calls")
 
@@ -78,9 +112,6 @@ class Agent:
 
     @staticmethod
     def _assistant_message(assistant: Any) -> Dict[str, Any]:
-        if hasattr(assistant, "model_dump"):
-            return assistant.model_dump(exclude_none=True)
-
         message: Dict[str, Any] = {
             "role": "assistant",
             "content": getattr(assistant, "content", None),

@@ -5,14 +5,7 @@ from typing import Any, Dict, List
 
 from ..workspace import Workspace
 from .base import Tool
-
-IGNORED_NAMES = {".git", ".venv", "__pycache__"}
-
-
-def _is_sensitive_name(name: str) -> bool:
-    if name == ".env" or (name.startswith(".env.") and name != ".env.example"):
-        return True
-    return Path(name).suffix.lower() in {".key", ".pem", ".p12", ".pfx"}
+from .safety import DENIED_PATH_NAMES, ensure_safe_path, is_sensitive_name
 
 
 class ListFilesTool(Tool):
@@ -50,8 +43,8 @@ class ListFilesTool(Tool):
         entries: List[str] = []
         for path in sorted(directory.rglob("*")):
             relative_parts = path.relative_to(directory).parts
-            if any(part in IGNORED_NAMES for part in relative_parts) or any(
-                _is_sensitive_name(part) for part in relative_parts
+            if any(part in DENIED_PATH_NAMES for part in relative_parts) or any(
+                is_sensitive_name(part) for part in relative_parts
             ):
                 continue
             suffix = "/" if path.is_dir() else ""
@@ -97,11 +90,7 @@ class ReadFileTool(Tool):
             raise ValueError(f"file does not exist: {relative_path}")
         if not path.is_file():
             raise ValueError(f"path is not a file: {relative_path}")
-        relative_parts = path.relative_to(self.workspace.root).parts
-        if any(part in IGNORED_NAMES for part in relative_parts) or any(
-            _is_sensitive_name(part) for part in relative_parts
-        ):
-            raise ValueError(f"access to sensitive path is denied: {relative_path}")
+        ensure_safe_path(path, self.workspace.root)
 
         text = path.read_text(encoding="utf-8")
         truncated = len(text) > self.max_chars

@@ -26,6 +26,7 @@ class OpenAICompatibleLLM:
 
     def __init__(self, settings: Settings) -> None:
         self.model = settings.model
+        self.max_output_tokens = settings.max_output_tokens
         self.client = OpenAI(
             api_key=settings.api_key,
             base_url=settings.base_url,
@@ -39,6 +40,7 @@ class OpenAICompatibleLLM:
         request: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
+            "max_tokens": self.max_output_tokens,
         }
         if tools:
             request["tools"] = tools
