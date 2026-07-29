@@ -12,10 +12,13 @@ from .memory import ProjectMemoryStore
 from .session import SessionManager, write_trace
 from .tools import (
     ApplyPatchTool,
+    FindFilesTool,
     ListFilesTool,
     ReadEpisodeTool,
     ReadFileTool,
+    RepositoryMapTool,
     RunCommandTool,
+    SearchCodeTool,
     SearchMemoryTool,
     ToolRegistry,
 )
@@ -32,6 +35,9 @@ def build_agent(
     tools = ToolRegistry(
         [
             ListFilesTool(workspace),
+            FindFilesTool(workspace),
+            SearchCodeTool(workspace),
+            RepositoryMapTool(workspace),
             ReadFileTool(workspace),
             ApplyPatchTool(workspace),
             RunCommandTool(workspace),

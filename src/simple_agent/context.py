@@ -134,9 +134,9 @@ class ContextManager:
                 {
                     "role": "system",
                     "content": (
-                        f"{removed} earlier tool-interaction block(s) were "
-                        "removed to stay within the context budget. Re-read "
-                        "files if their exact contents are needed."
+                        f"为控制上下文大小，已移除 {removed} 个较早的完整工具"
+                        "交互块。如果后续仍需要其中的精确文件内容，请重新调用"
+                        "工具读取，不要依赖记忆猜测。"
                     ),
                 }
             )

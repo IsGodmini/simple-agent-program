@@ -6,8 +6,10 @@
 
 - 多轮 Chat Completions 调用
 - 标准 `tools` / `tool_calls` 工具协议
-- 列出项目文件
-- 读取项目内的 UTF-8 文本文件
+- 分页列出和查找大型项目文件
+- 搜索代码、符号及调用位置
+- 生成紧凑仓库地图
+- 按行分段读取大型 UTF-8 文本文件
 - 创建新文件或精确替换已有文本
 - 运行受控的测试、构建和静态检查命令
 - 按需将完整执行过程保存为 JSON
@@ -52,8 +54,11 @@ simple-agent \
 
 ## 工具
 
-- `list_files`：列出项目结构
-- `read_file`：读取带行号的 UTF-8 文本
+- `repository_map`：统计技术栈清单、入口、扩展名和顶层模块
+- `list_files`：按深度和 offset 分页列出项目结构
+- `find_files`：使用 Glob 分页查找文件
+- `search_code`：搜索文本或正则表达式，返回文件和行号
+- `read_file`：使用行范围分段读取带行号的文本
 - `apply_patch`：创建文件，或通过唯一的 `old_text` 精确替换文本
 - `run_command`：运行允许列表内的命令，不经过 Shell
 - `search_memory`：搜索之前需求的紧凑摘要

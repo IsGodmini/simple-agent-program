@@ -57,7 +57,7 @@ class ContextManagerTests(unittest.TestCase):
         self.assertEqual(prepared.removed_blocks, 1)
         self.assertNotIn("old-call", serialized)
         self.assertIn("latest-call", serialized)
-        self.assertIn("earlier tool-interaction", serialized)
+        self.assertIn("较早的完整工具", serialized)
 
     def test_oversized_unshrinkable_request_is_rejected(self):
         manager = ContextManager(
