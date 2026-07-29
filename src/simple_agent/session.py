@@ -89,6 +89,7 @@ class SessionManager:
                 "final_content": result.content,
                 "iterations": result.iterations,
                 "compactions": result.compactions,
+                "workflow": result.workflow,
                 "files_changed": files_changed,
                 "validations": validations,
                 "tool_executions": [
@@ -126,6 +127,7 @@ class SessionManager:
                 "memory_summary_ids": session.memory_summary_ids,
                 "knowledge_citations": session.knowledge_citations,
                 "error": error_text,
+                "workflow": getattr(error, "workflow", None),
             },
         )
         self.store.append_summary(summary)
@@ -176,6 +178,7 @@ def write_trace(path: Path, user_request: str, result: AgentResult) -> None:
         "user_request": user_request,
         "iterations": result.iterations,
         "compactions": result.compactions,
+        "workflow": result.workflow,
         "final_content": result.content,
         "tool_executions": [
             asdict(execution) for execution in result.tool_executions

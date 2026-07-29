@@ -25,6 +25,12 @@ class Settings:
     max_input_tokens: int = 96_000
     max_output_tokens: int = 16_000
     compact_at_tokens: int = 80_000
+    agent_mode: str = "auto"
+    plan_complexity_threshold: int = 3
+    max_plan_steps: int = 8
+    max_step_revisions: int = 1
+    planner_max_iterations: int = 6
+    reviewer_max_iterations: int = 6
 
     def __post_init__(self) -> None:
         budget_values = (
@@ -35,6 +41,18 @@ class Settings:
         )
         if self.max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
+        if self.agent_mode not in {"auto", "react", "plan"}:
+            raise ValueError("AGENT_MODE must be auto, react, or plan")
+        workflow_values = (
+            self.plan_complexity_threshold,
+            self.max_plan_steps,
+            self.planner_max_iterations,
+            self.reviewer_max_iterations,
+        )
+        if any(value < 1 for value in workflow_values):
+            raise ValueError("all workflow limits must be positive")
+        if not 0 <= self.max_step_revisions <= 3:
+            raise ValueError("AGENT_MAX_STEP_REVISIONS must be from 0 to 3")
         if any(value < 1 for value in budget_values):
             raise ValueError("all context budget values must be positive")
         if self.compact_at_tokens > self.max_input_tokens:
@@ -60,5 +78,19 @@ class Settings:
             max_output_tokens=int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "16000")),
             compact_at_tokens=int(
                 os.getenv("AGENT_COMPACT_AT_TOKENS", "80000")
+            ),
+            agent_mode=os.getenv("AGENT_MODE", "auto").lower(),
+            plan_complexity_threshold=int(
+                os.getenv("AGENT_PLAN_COMPLEXITY_THRESHOLD", "3")
+            ),
+            max_plan_steps=int(os.getenv("AGENT_MAX_PLAN_STEPS", "8")),
+            max_step_revisions=int(
+                os.getenv("AGENT_MAX_STEP_REVISIONS", "1")
+            ),
+            planner_max_iterations=int(
+                os.getenv("AGENT_PLANNER_MAX_ITERATIONS", "6")
+            ),
+            reviewer_max_iterations=int(
+                os.getenv("AGENT_REVIEWER_MAX_ITERATIONS", "6")
             ),
         )

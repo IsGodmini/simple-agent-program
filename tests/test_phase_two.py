@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 
 from simple_agent.agent import AgentResult, ToolExecution
 from simple_agent.session import write_trace
-from simple_agent.tools import ApplyPatchTool, RunCommandTool
+from simple_agent.tools import ApplyPatchTool, ReadOnlyCommandTool, RunCommandTool
 from simple_agent.workspace import Workspace
 
 
@@ -95,6 +95,17 @@ class RunCommandToolTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "subcommand"):
                 tool.execute({"command": ["git", "reset", "--hard"]})
 
+    def test_reviewer_command_tool_rejects_mutating_commands(self):
+        with TemporaryDirectory() as directory:
+            tool = ReadOnlyCommandTool(Workspace(Path(directory)))
+
+            with self.assertRaisesRegex(ValueError, "read-only reviewer"):
+                tool.execute({"command": ["cargo", "fmt"]})
+            with self.assertRaisesRegex(ValueError, "source-modifying"):
+                tool.execute({"command": ["ruff", "check", "--fix", "."]})
+            with self.assertRaisesRegex(ValueError, "read-only reviewer"):
+                tool.execute({"command": ["npm", "test"]})
+
 
 class TraceTests(unittest.TestCase):
     def test_trace_is_written_only_to_requested_path(self):
@@ -112,6 +123,7 @@ class TraceTests(unittest.TestCase):
                         result="README.md",
                     )
                 ],
+                workflow={"mode": "react", "reviews": []},
             )
 
             write_trace(path, "task", result)
@@ -119,6 +131,7 @@ class TraceTests(unittest.TestCase):
 
             self.assertEqual(trace["final_content"], "done")
             self.assertEqual(trace["tool_executions"][0]["name"], "list_files")
+            self.assertEqual(trace["workflow"]["mode"], "react")
 
 
 if __name__ == "__main__":

@@ -56,6 +56,10 @@ class MemoryLifecycleTests(unittest.TestCase):
                         result="Exit code: 0\nSTDOUT:\nOK",
                     ),
                 ],
+                workflow={
+                    "mode": "plan_and_act",
+                    "reviews": [{"verdict": "pass"}],
+                },
             )
 
             summary = manager.complete_task(first, result)
@@ -71,6 +75,7 @@ class MemoryLifecycleTests(unittest.TestCase):
             self.assertIn("登录接口已经完成", context)
             self.assertNotIn("RAW_INTERNAL_TOOL_RESULT", context)
             self.assertIn("RAW_INTERNAL_TOOL_RESULT", json.dumps(episode))
+            self.assertEqual(episode["workflow"]["mode"], "plan_and_act")
             self.assertTrue(
                 all(
                     message.get("role") != "system"

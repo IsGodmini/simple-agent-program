@@ -13,6 +13,8 @@ from simple_agent.session import SessionManager
 from simple_agent.tools import (
     ListKnowledgeTool,
     ReadKnowledgeTool,
+    ReadOnlyCommandTool,
+    RunCommandTool,
     SearchKnowledgeTool,
 )
 from simple_agent.workspace import Workspace
@@ -338,6 +340,18 @@ class KnowledgeCliTests(unittest.TestCase):
             self.assertIn("search_knowledge", names)
             self.assertIn("read_knowledge", names)
             self.assertIn("list_knowledge", names)
+            self.assertIsInstance(
+                agent.tools._tools["run_command"],
+                RunCommandTool,
+            )
+            self.assertNotIsInstance(
+                agent.tools._tools["run_command"],
+                ReadOnlyCommandTool,
+            )
+            self.assertIsInstance(
+                agent.reviewer.agent.tools._tools["run_command"],
+                ReadOnlyCommandTool,
+            )
 
 
 if __name__ == "__main__":

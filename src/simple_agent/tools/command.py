@@ -179,3 +179,51 @@ class RunCommandTool(Tool):
                 + f"\n... output truncated after {self.max_output_chars} characters"
             )
         return output
+
+
+class ReadOnlyCommandTool(RunCommandTool):
+    """Run only commands suitable for a reviewer with no source-write tools."""
+
+    description = (
+        "Run read-only Git inspection, tests, or non-mutating static checks. "
+        "Formatting, builds that create workspace outputs, package scripts, "
+        "and fix flags are not allowed."
+    )
+
+    def _validate_command(self, command: List[str]) -> None:
+        super()._validate_command(command)
+        executable = Path(command[0]).name
+        forbidden_flags = {"--fix", "--unsafe-fixes", "--write"}
+        if forbidden_flags & set(command[1:]):
+            raise ValueError("review commands cannot use source-modifying flags")
+
+        if executable == "git":
+            return
+        if executable.startswith("python"):
+            if command[1:] in (["--version"], ["-V"]):
+                return
+            module = command[2]
+            if module in {"pytest", "unittest", "mypy"}:
+                return
+            if module == "ruff" and len(command) > 3 and command[3] == "check":
+                return
+            raise ValueError(
+                f"Python module is not read-only reviewer allowlisted: {module}"
+            )
+        if executable in {"pytest", "mypy"}:
+            return
+        if executable == "ruff":
+            if len(command) > 1 and command[1] == "check":
+                return
+            raise ValueError("reviewer ruff commands must use 'ruff check'")
+        if executable == "go" and command[1] in {"test", "vet"}:
+            return
+        if executable == "cargo" and command[1] in {
+            "check",
+            "clippy",
+            "test",
+        }:
+            return
+        raise ValueError(
+            f"command is not read-only reviewer allowlisted: {command[0]}"
+        )

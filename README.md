@@ -19,6 +19,8 @@
 - 自动保存任务摘要，并按需检索详细情景记忆
 - 导入多格式项目资料并构建本地 RAG 知识库
 - 按需求自动检索相关规范，也可通过工具继续查询和精读
+- 自动在 ReAct 与 Plan-and-Act 之间路由复杂任务
+- 使用独立 Reflection Reviewer 基于代码和测试证据验收结果
 - 限制工具只能访问指定工作目录
 - 隐藏并拒绝读取 `.env`、私钥和 Git 内部文件
 - 最大迭代次数保护
@@ -45,6 +47,29 @@ simple-agent "分析这个项目当前实现了什么"
 ```bash
 simple-agent --workspace /path/to/project "分析项目结构"
 ```
+
+默认使用 `auto` 模式：小型任务直接进入 ReAct；复杂任务会先由只读 Planner
+调查仓库并生成结构化计划，再为每个步骤创建隔离的 Executor，最后由只读
+Reflection Reviewer 检查需求、代码和验证证据。
+
+```bash
+# 强制使用普通 ReAct
+simple-agent --agent-mode react "修正 README 中的错别字"
+
+# 强制使用 Plan-and-Act
+simple-agent --agent-mode plan "重构认证模块并完成数据库迁移"
+```
+
+普通 ReAct 执行过程中如果发现新的复杂子任务，也可以向顶层编排器申请一次
+Plan-and-Act 升级。编排器不允许子 Agent 继续递归创建 Agent。
+
+角色权限：
+
+- Planner：仅能搜索和读取项目、记忆与知识库。
+- Executor：可以读取、精确修改文件并运行受控命令。
+- Reviewer：不能修改文件，但可以读取当前代码、Git 差异和运行受控验证。
+
+计划步骤、实际工具证据、评审结论和修订次数会写入 Episode 与可选 trace。
 
 保存完整执行日志：
 
@@ -126,6 +151,12 @@ LLM_CONTEXT_WINDOW=128000
 LLM_MAX_INPUT_TOKENS=96000
 LLM_MAX_OUTPUT_TOKENS=16000
 AGENT_COMPACT_AT_TOKENS=80000
+AGENT_MODE=auto
+AGENT_PLAN_COMPLEXITY_THRESHOLD=3
+AGENT_MAX_PLAN_STEPS=8
+AGENT_MAX_STEP_REVISIONS=1
+AGENT_PLANNER_MAX_ITERATIONS=6
+AGENT_REVIEWER_MAX_ITERATIONS=6
 ```
 
 Agent 会使用保守的 UTF-8 长度估算请求 Token。在达到压缩阈值后，只会

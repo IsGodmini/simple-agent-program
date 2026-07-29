@@ -1,7 +1,7 @@
 """Built-in tools."""
 
 from .base import Tool, ToolRegistry
-from .command import RunCommandTool
+from .command import ReadOnlyCommandTool, RunCommandTool
 from .edit import ApplyPatchTool
 from .files import (
     FindFilesTool,
@@ -21,6 +21,7 @@ __all__ = [
     "ReadEpisodeTool",
     "ReadFileTool",
     "ReadKnowledgeTool",
+    "ReadOnlyCommandTool",
     "RepositoryMapTool",
     "RunCommandTool",
     "SearchCodeTool",

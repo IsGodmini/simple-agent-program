@@ -28,6 +28,7 @@ class AgentResult:
     messages: List[Message]
     tool_executions: List[ToolExecution]
     compactions: int = 0
+    workflow: Optional[Dict[str, Any]] = None
 
 
 class Agent:

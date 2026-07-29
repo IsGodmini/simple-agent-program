@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 from typing import List, Optional
 
-from .agent import Agent
 from .config import Settings
 from .context import ContextBudget, ContextManager
 from .knowledge import KnowledgeBase, document_to_dict, is_supported_document
@@ -20,6 +19,7 @@ from .tools import (
     ReadEpisodeTool,
     ReadFileTool,
     ReadKnowledgeTool,
+    ReadOnlyCommandTool,
     RepositoryMapTool,
     RunCommandTool,
     SearchCodeTool,
@@ -28,18 +28,20 @@ from .tools import (
     ToolRegistry,
 )
 from .workspace import Workspace
+from .workflow import WorkflowConfig, WorkflowOrchestrator
 
 
 def build_agent(
     workspace_path: Path,
     memory_store: Optional[ProjectMemoryStore] = None,
     knowledge_base: Optional[KnowledgeBase] = None,
-) -> Agent:
+    agent_mode: Optional[str] = None,
+) -> WorkflowOrchestrator:
     settings = Settings.from_env()
     workspace = Workspace(workspace_path)
     memory_store = memory_store or ProjectMemoryStore(workspace)
     knowledge_base = knowledge_base or KnowledgeBase(workspace)
-    tools = ToolRegistry(
+    executor_tools = ToolRegistry(
         [
             ListFilesTool(workspace),
             FindFilesTool(workspace),
@@ -55,18 +57,58 @@ def build_agent(
             ReadEpisodeTool(memory_store),
         ]
     )
-    return Agent(
+    planning_tools = ToolRegistry(
+        [
+            ListFilesTool(workspace),
+            FindFilesTool(workspace),
+            SearchCodeTool(workspace),
+            RepositoryMapTool(workspace),
+            ReadFileTool(workspace),
+            SearchKnowledgeTool(knowledge_base),
+            ReadKnowledgeTool(knowledge_base),
+            ListKnowledgeTool(knowledge_base),
+            SearchMemoryTool(memory_store),
+            ReadEpisodeTool(memory_store),
+        ]
+    )
+    review_tools = ToolRegistry(
+        [
+            ListFilesTool(workspace),
+            FindFilesTool(workspace),
+            SearchCodeTool(workspace),
+            RepositoryMapTool(workspace),
+            ReadFileTool(workspace),
+            ReadOnlyCommandTool(workspace),
+            SearchKnowledgeTool(knowledge_base),
+            ReadKnowledgeTool(knowledge_base),
+            ListKnowledgeTool(knowledge_base),
+            SearchMemoryTool(memory_store),
+            ReadEpisodeTool(memory_store),
+        ]
+    )
+    context_manager = ContextManager(
+        ContextBudget(
+            context_window=settings.context_window,
+            max_input_tokens=settings.max_input_tokens,
+            max_output_tokens=settings.max_output_tokens,
+            compact_at_tokens=settings.compact_at_tokens,
+        )
+    )
+    return WorkflowOrchestrator(
         llm=OpenAICompatibleLLM(settings),
-        tools=tools,
-        max_iterations=settings.max_iterations,
-        context_manager=ContextManager(
-            ContextBudget(
-                context_window=settings.context_window,
-                max_input_tokens=settings.max_input_tokens,
-                max_output_tokens=settings.max_output_tokens,
-                compact_at_tokens=settings.compact_at_tokens,
-            )
+        executor_tools=executor_tools,
+        planning_tools=planning_tools,
+        review_tools=review_tools,
+        config=WorkflowConfig(
+            mode=agent_mode or settings.agent_mode,
+            complexity_threshold=settings.plan_complexity_threshold,
+            max_plan_steps=settings.max_plan_steps,
+            max_step_revisions=settings.max_step_revisions,
+            planner_iterations=settings.planner_max_iterations,
+            executor_iterations=settings.max_iterations,
+            reviewer_iterations=settings.reviewer_max_iterations,
         ),
+        context_manager=context_manager,
     )
 
 
@@ -85,6 +127,11 @@ def parse_args() -> argparse.Namespace:
         "--trace-file",
         type=Path,
         help="Optionally save the complete execution trace as JSON.",
+    )
+    parser.add_argument(
+        "--agent-mode",
+        choices=["auto", "react", "plan"],
+        help="Override AGENT_MODE for this task.",
     )
     parser.add_argument(
         "--knowledge-file",
@@ -147,6 +194,7 @@ def main() -> None:
             args.workspace,
             memory_store=memory_store,
             knowledge_base=knowledge_base,
+            agent_mode=args.agent_mode,
         ).run(
             request,
             context_messages=task.context_messages,
