@@ -54,8 +54,40 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(result.iterations, 2)
             self.assertEqual(result.tool_executions[0].name, "list_files")
             second_request = llm.requests[1][0]
-            self.assertEqual(second_request[-1]["role"], "tool")
-            self.assertIn("README.md", second_request[-1]["content"])
+            latest_tool = next(
+                message
+                for message in reversed(second_request)
+                if message["role"] == "tool"
+            )
+            self.assertIn("README.md", latest_tool["content"])
+            for request_messages, _ in llm.requests:
+                reminder = request_messages[-1]
+                self.assertEqual(reminder["role"], "user")
+                self.assertIn(
+                    "What files are here?",
+                    reminder["content"],
+                )
+                self.assertIn("如果现有证据已经足够", reminder["content"])
+            self.assertFalse(
+                any(
+                    "任务锚点（第" in str(message.get("content", ""))
+                    for message in result.messages
+                )
+            )
+
+    def test_every_model_call_keeps_root_requirement_for_subtask(self):
+        with TemporaryDirectory() as directory:
+            registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])
+            llm = FakeLLM([assistant_message(content="子任务完成")])
+
+            Agent(llm, registry).run(
+                "只检查配置文件",
+                root_requirement="实现用户登录并通过测试",
+            )
+
+            reminder = llm.requests[0][0][-1]["content"]
+            self.assertIn("实现用户登录并通过测试", reminder)
+            self.assertIn("只检查配置文件", reminder)
 
     def test_agent_reports_model_and_tool_progress(self):
         with TemporaryDirectory() as directory:

@@ -262,7 +262,8 @@ class KnowledgeContextTests(unittest.TestCase):
                 knowledge_base=knowledge,
             ).build("调整前端按钮颜色")
 
-            self.assertEqual(built.messages, [])
+            self.assertEqual(len(built.messages), 1)
+            self.assertIn("调整前端按钮颜色", built.messages[0]["content"])
             self.assertEqual(built.knowledge_citations, [])
 
 

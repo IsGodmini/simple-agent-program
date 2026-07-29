@@ -1,6 +1,6 @@
 # Simple Agent Program
 
-一个使用 OpenAI 兼容接口和工具调用能力的最小开发 Agent。
+一个使用 OpenAI 兼容接口、持久化项目理解和工具调用能力的本地优先开发 Agent。
 
 当前支持：
 
@@ -26,6 +26,18 @@
 - 限制工具只能访问指定工作目录
 - 隐藏并拒绝读取 `.env`、私钥和 Git 内部文件
 - 最大迭代次数保护
+
+## 文档导航
+
+- [系统架构](docs/architecture.md)：模块职责、执行链路、工作流和持久化状态
+- [上下文与记忆](docs/context-and-memory.md)：上下文顺序、隔离、压缩和任务锚点
+- [LLM 与工具协议](docs/llm-protocol.md)：请求/响应 JSON、工具调用和收尾
+- [Web API](docs/web-api.md)：本地 HTTP 接口、Job 状态和调用示例
+- [安全边界](docs/security.md)：远程模型、文件、命令和本地 Web 风险
+- [故障排查](docs/troubleshooting.md)：配置、循环、索引、知识库和 Web 问题
+- [二次开发](docs/development.md)：项目结构、扩展方式、测试和提交检查
+
+完整文档索引见 [docs/README.md](docs/README.md)。
 
 ## 安装
 
@@ -56,10 +68,12 @@ simple-agent-web --workspace /path/to/project
 然后访问 [http://127.0.0.1:8765](http://127.0.0.1:8765)。也可以用
 `--port` 指定其他端口。
 
-客户端和 Agent 都只在本机运行，服务只允许绑定 `127.0.0.1` 或 `localhost`。
-任务状态在页面中实时轮询；会话、需求摘要、场景记忆和知识库仍持久化在目标项目
-的 `.simple-agent/` 目录中。为了避免多个 Agent 同时修改同一个项目，同一工作区
-提交的需求会串行执行。
+Web 服务、工具执行和持久化数据位于本机，服务只允许绑定 `127.0.0.1` 或
+`localhost`；选中的需求、代码片段和工具结果会发送到 `.env` 配置的远程 LLM
+服务。任务状态在页面中实时轮询；会话、需求摘要、场景记忆和知识库仍持久化在
+目标项目的 `.simple-agent/` 目录中。为了避免多个 Agent 同时修改同一个项目，
+同一工作区提交的需求会串行执行。Web Job 只保存在当前进程内，服务重启后不会
+恢复排队或运行中的 Job。
 
 模型的完整回复会按安全 Markdown 渲染，支持标题、列表、任务列表、引用、链接、
 图片、代码块和表格。执行观察区会实时显示上下文构建、模式路由、模型调用、工具
@@ -237,6 +251,9 @@ simple-agent --workspace /path/to/project --index-status
 默认配置：
 
 ```env
+LLM_MODEL=ark-code-latest
+LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+LLM_API_KEY=your-api-key
 LLM_CONTEXT_WINDOW=128000
 LLM_MAX_INPUT_TOKENS=96000
 LLM_MAX_OUTPUT_TOKENS=16000
@@ -272,6 +289,13 @@ Agent 仍在读取新的证据、产生新的代码修改或获得新的测试�
 Agent 会使用保守的 UTF-8 长度估算请求 Token。在达到压缩阈值后，只会
 淘汰完整的旧工具交互块，保留最初的系统消息、用户任务和最新工具结果。
 如果安全压缩后仍超过输入上限，请求会在本地终止。
+
+当前用户需求会以不可丢失的任务锚点加入需求上下文。除此之外，每次调用 LLM
+前都会在上下文末尾临时加入原始需求、当前子任务范围和目的驱动约束：工具结果
+必须能够推进实现决策、代码修改或验证，否则应停止继续调查；证据足够时必须
+立即回复。这个逐轮提醒不会写回长期对话，所以不会随循环次数重复累积。
+Planner、Executor、Reflection Reviewer、修复任务和最终结果整理始终共享同一个
+原始需求，即使早期工具交互被上下文压缩也不会丢失总体目标。
 
 ## 跨需求记忆
 

@@ -11,6 +11,23 @@ from simple_agent.workspace import Workspace
 
 
 class MemoryLifecycleTests(unittest.TestCase):
+    def test_current_requirement_is_always_anchored_in_context(self):
+        with TemporaryDirectory() as directory:
+            store = ProjectMemoryStore(Workspace(Path(directory)))
+
+            built = ContextBuilder(store).build("实现支付接口并通过测试")
+
+            self.assertTrue(built.messages)
+            self.assertEqual(built.messages[0]["role"], "system")
+            self.assertIn(
+                "实现支付接口并通过测试",
+                built.messages[0]["content"],
+            )
+            self.assertIn(
+                "current_requirement_json",
+                built.messages[0]["content"],
+            )
+
     def test_new_task_gets_summary_but_not_old_raw_tool_transcript(self):
         with TemporaryDirectory() as directory:
             workspace = Workspace(Path(directory))

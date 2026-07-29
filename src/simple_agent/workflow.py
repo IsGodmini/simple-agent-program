@@ -393,8 +393,13 @@ class PlannerAgent:
         self,
         request: str,
         context_messages: Sequence[Message],
+        root_requirement: Optional[str] = None,
     ) -> Tuple[TaskPlan, AgentResult]:
-        result = self.agent.run(request, context_messages=context_messages)
+        result = self.agent.run(
+            request,
+            context_messages=context_messages,
+            root_requirement=root_requirement,
+        )
         if result.stop_reason:
             raise WorkflowFinalized(result)
         plan = TaskPlan.from_dict(
@@ -431,10 +436,12 @@ class ReflectionAgent:
         self,
         review_request: Dict[str, Any],
         context_messages: Sequence[Message],
+        root_requirement: Optional[str] = None,
     ) -> Tuple[ReviewResult, AgentResult]:
         result = self.agent.run(
             json.dumps(review_request, ensure_ascii=False, indent=2),
             context_messages=context_messages,
+            root_requirement=root_requirement,
         )
         if result.stop_reason:
             raise WorkflowFinalized(result)
@@ -487,6 +494,7 @@ class WorkflowOrchestrator:
         self._iteration_budget = IterationBudget(
             self.config.total_iteration_budget
         )
+        self._root_requirement = user_request
         self._completed_results: List[AgentResult] = []
         self.planner.agent.iteration_budget = self._iteration_budget
         self.reviewer.agent.iteration_budget = self._iteration_budget
@@ -621,6 +629,7 @@ class WorkflowOrchestrator:
         plan, planning_result = self.planner.create(
             planning_request or request,
             context,
+            root_requirement=self._root_requirement,
         )
         self._completed_results.append(planning_result)
         self._emit(
@@ -740,6 +749,7 @@ class WorkflowOrchestrator:
         final_review, final_review_result = self.reviewer.review(
             final_review_request,
             context,
+            root_requirement=self._root_requirement,
         )
         self._completed_results.append(final_review_result)
         self._emit(
@@ -773,6 +783,7 @@ class WorkflowOrchestrator:
             final_review, reviewed_repair = self.reviewer.review(
                 repaired_review_request,
                 context,
+                root_requirement=self._root_requirement,
             )
             self._completed_results.append(reviewed_repair)
             all_results.append(reviewed_repair)
@@ -824,7 +835,11 @@ class WorkflowOrchestrator:
             iteration_budget=self._iteration_budget,
             iteration_extension=self.config.iteration_extension,
             stagnation_limit=self.config.stagnation_limit,
-        ).run(request, context_messages=context)
+        ).run(
+            request,
+            context_messages=context,
+            root_requirement=self._root_requirement,
+        )
         if result.stop_reason:
             raise WorkflowFinalized(result)
         self._completed_results.append(result)
@@ -858,6 +873,7 @@ class WorkflowOrchestrator:
             review, review_agent_result = self.reviewer.review(
                 review_request,
                 context,
+                root_requirement=self._root_requirement,
             )
             self._completed_results.append(review_agent_result)
             reviews.append(review)
@@ -945,6 +961,14 @@ class WorkflowOrchestrator:
             [
                 {"role": "system", "content": SYNTHESIZER_PROMPT},
                 message,
+                {
+                    "role": "user",
+                    "content": Agent._goal_reminder(
+                        self._root_requirement,
+                        "根据已完成步骤和评审证据生成最终答复",
+                        self._iteration_budget.used,
+                    ),
+                },
             ]
         )
         content = getattr(assistant, "content", None)

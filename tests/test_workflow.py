@@ -346,6 +346,13 @@ class WorkflowOrchestratorTests(unittest.TestCase):
                 result.content,
                 "复杂改造已经完成并通过评审。",
             )
+            for request_messages, _ in llm.requests:
+                serialized = json.dumps(
+                    request_messages,
+                    ensure_ascii=False,
+                )
+                self.assertIn("完成复杂改造", serialized)
+                self.assertIn("只执行能直接推进原始需求", serialized)
 
     def test_revise_verdict_creates_one_bounded_repair(self):
         with TemporaryDirectory() as directory:

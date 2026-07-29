@@ -100,9 +100,15 @@ class Agent:
         self,
         user_request: str,
         context_messages: Optional[Sequence[Message]] = None,
+        root_requirement: Optional[str] = None,
     ) -> AgentResult:
         if not user_request.strip():
             raise ValueError("user request cannot be empty")
+        active_requirement = (
+            root_requirement.strip()
+            if isinstance(root_requirement, str) and root_requirement.strip()
+            else user_request.strip()
+        )
 
         messages: List[Message] = [
             {"role": "system", "content": self.system_prompt},
@@ -149,6 +155,7 @@ class Agent:
                     iteration,
                     "budget_exhausted",
                     "需求已达到模型调用硬上限",
+                    active_requirement,
                 )
             if (
                 self.iteration_budget
@@ -196,12 +203,26 @@ class Agent:
                 ),
                 message=f"{self.progress_role} 正在分析并决定下一步",
             )
+            goal_reminder = {
+                "role": "user",
+                "content": self._goal_reminder(
+                    active_requirement,
+                    user_request,
+                    iteration,
+                ),
+            }
+            request_messages = [*messages, goal_reminder]
             if self.context_manager:
                 prepared = self.context_manager.prepare(
-                    messages,
+                    request_messages,
                     self.tools.definitions,
                 )
-                messages = prepared.messages
+                request_messages = prepared.messages
+                messages = [
+                    message
+                    for message in prepared.messages
+                    if message != goal_reminder
+                ]
                 compactions += prepared.removed_blocks
                 if prepared.removed_blocks:
                     self._emit(
@@ -212,7 +233,7 @@ class Agent:
                     )
             try:
                 assistant = self.llm.complete(
-                    messages,
+                    request_messages,
                     self.tools.definitions,
                 )
             except Exception as exc:
@@ -229,6 +250,7 @@ class Agent:
                     iteration + 1,
                     "model_error",
                     f"模型请求异常：{type(exc).__name__}",
+                    active_requirement,
                 )
             messages.append(self._assistant_message(assistant))
 
@@ -324,6 +346,7 @@ class Agent:
                             f"连续 {stagnant_iterations} 轮工具调用"
                             "没有产生新证据"
                         ),
+                        active_requirement,
                     )
                 if iteration >= current_allowance:
                     previous_allowance = current_allowance
@@ -366,6 +389,7 @@ class Agent:
                 iteration + 1,
                 "empty_model_response",
                 "模型返回了空响应",
+                active_requirement,
             )
 
     def _force_final_answer(
@@ -376,6 +400,7 @@ class Agent:
         iteration: int,
         stop_reason: str,
         reason_text: str,
+        root_requirement: str,
     ) -> AgentResult:
         """Spend the reserved call on a tool-free answer, then fall back locally."""
 
@@ -388,6 +413,10 @@ class Agent:
                     "调用任何工具。请仅根据已经获得的证据说明：已完成什么、"
                     "验证情况、尚未完成或无法确认的部分，以及建议的下一步。"
                     f"停止原因：{reason_text}。不要声称未经验证的工作已经完成。"
+                    "\n必须继续以以下原始用户需求为唯一目标：\n"
+                    f"<original_user_requirement>\n"
+                    f"{root_requirement[:8_000]}\n"
+                    "</original_user_requirement>"
                 ),
             },
         ]
@@ -483,6 +512,25 @@ class Agent:
             f"{self.iteration_budget.remaining} 次。每次调用都应推进需求：优先"
             "复用项目索引，避免重复读取和无目的探索，获得足够证据后及时修改、"
             "验证并结束。接近预算上限时必须收敛或明确报告阻塞。"
+        )
+
+    @staticmethod
+    def _goal_reminder(
+        root_requirement: str,
+        current_scope: str,
+        iteration: int,
+    ) -> str:
+        root = root_requirement[:8_000]
+        scope = current_scope[:4_000]
+        return (
+            f"任务锚点（第 {iteration} 次调用，本消息不是新需求）：\n"
+            f"<original_user_requirement>\n{root}\n"
+            "</original_user_requirement>\n"
+            f"<current_agent_scope>\n{scope}\n</current_agent_scope>\n"
+            "只执行能直接推进原始需求或其当前验收条件的动作。调用工具前先"
+            "确认该结果会改变实现决策、完成代码修改或验证结果；不要重复读取"
+            "已有证据，不要为了继续调查而调查。如果现有证据已经足够，立即"
+            "给出最终回复，不再调用工具。不要输出内部思维链。"
         )
 
     @staticmethod

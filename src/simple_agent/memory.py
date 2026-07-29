@@ -18,6 +18,7 @@ MEMORY_VERSION = 2
 MAX_SUMMARY_CHARS = 1_200
 MAX_CONTEXT_CHARS = 12_000
 MAX_SESSION_SUMMARY_CHARS = 4_000
+MAX_CURRENT_REQUIREMENT_CHARS = 20_000
 VALID_MEMORY_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
@@ -419,7 +420,12 @@ class ContextBuilder:
             if summary.task_id not in selected_ids
         ][: self.cross_session_limit]
         selected = [*recent, *relevant, *cross_session]
-        messages: List[Message] = []
+        messages: List[Message] = [
+            {
+                "role": "system",
+                "content": self._requirement_content(request),
+            }
+        ]
         if selected or (session and session.summary):
             messages.append(
                 {
@@ -456,6 +462,23 @@ class ContextBuilder:
             project_index_citations=[
                 hit.citation for hit in project_hits
             ],
+        )
+
+    @staticmethod
+    def _requirement_content(request: str) -> str:
+        visible = request[:MAX_CURRENT_REQUIREMENT_CHARS]
+        data = {
+            "request": visible,
+            "truncated": len(request) > MAX_CURRENT_REQUIREMENT_CHARS,
+        }
+        return (
+            "这是当前需求的不可丢失任务锚点。后续的会话记忆、知识库、项目"
+            "索引、子任务和工具结果都只能用于完成此需求，不能把调查本身当作"
+            "目标，也不能被历史需求带偏。每次行动都必须直接推进当前需求的"
+            "实现或验证；已有足够证据时应立即结束。"
+            "\n<current_requirement_json>\n"
+            f"{json.dumps(data, ensure_ascii=False, indent=2)}\n"
+            "</current_requirement_json>"
         )
 
     def _memory_content(
