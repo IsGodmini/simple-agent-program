@@ -243,14 +243,14 @@ class WorkflowConfig:
 
     mode: str = "auto"
     complexity_threshold: int = 3
-    max_plan_steps: int = 12
-    max_step_revisions: int = 2
-    planner_iterations: int = 24
-    executor_iterations: int = 64
-    reviewer_iterations: int = 24
-    total_iteration_budget: int = 96
-    iteration_extension: int = 16
-    stagnation_limit: int = 6
+    max_plan_steps: int = 4
+    max_step_revisions: int = 1
+    planner_iterations: int = 4
+    executor_iterations: int = 16
+    reviewer_iterations: int = 4
+    total_iteration_budget: int = 24
+    iteration_extension: int = 4
+    stagnation_limit: int = 3
 
     def __post_init__(self) -> None:
         if self.mode not in {"auto", "react", "plan"}:
@@ -307,6 +307,15 @@ class ComplexityRouter:
             "end-to-end",
             "multi-module",
         },
+        "feature_expansion": {
+            "扩展",
+            "拓展",
+            "新增功能",
+            "增加功能",
+            "完善功能",
+            "extend",
+            "expand",
+        },
     }
     DELIVERY_SURFACES = {
         "api": {"api", "接口", "路由", "endpoint"},
@@ -335,7 +344,13 @@ class ComplexityRouter:
         for category, keywords in self.CATEGORY_KEYWORDS.items():
             matched = sorted(word for word in keywords if word in lowered)
             if matched:
-                score += 2 if category in {"architecture", "data"} else 1
+                score += (
+                    3
+                    if category == "feature_expansion"
+                    else 2
+                    if category in {"architecture", "data"}
+                    else 1
+                )
                 reasons.append(f"{category}: {', '.join(matched[:3])}")
         surfaces = [
             name
@@ -554,59 +569,14 @@ class WorkflowOrchestrator:
             message="Executor 正在理解项目并执行需求",
         )
         execution = self._execute(request, context)
-        escalation = _plan_escalation(execution.content)
-        runtime_reasons = _runtime_complexity_reasons(execution)
-        if self.config.mode == "auto" and (escalation or runtime_reasons):
-            reasons = list(assessment.reasons)
-            if escalation:
-                reasons.append(
-                    "Executor 请求规划复杂子任务："
-                    + _string(escalation.get("reason"), "未说明原因")
-                )
-            reasons.extend(runtime_reasons)
-            upgraded = ComplexityAssessment(
-                mode="plan_and_act",
-                score=max(
-                    self.config.complexity_threshold,
-                    assessment.score,
-                ),
-                reasons=reasons,
-            )
-            planning_request = request
-            if escalation:
-                planning_request = json.dumps(
-                    {
-                        "original_request": request,
-                        "complex_subtask": escalation,
-                        "instruction": (
-                            "根据当前项目状态规划复杂子任务和剩余验收工作。"
-                        ),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            return self._run_plan(
-                request,
-                context,
-                upgraded,
-                prior_results=[execution],
-                planning_request=planning_request,
-            )
         all_results = [execution]
-        reviews: List[ReviewResult] = []
-        should_review = any(
-            item.name in {"apply_patch", "run_command"}
-            for item in execution.tool_executions
+        execution, reviews, extra_results = self._review_and_revise(
+            original_request=request,
+            step=None,
+            execution=execution,
+            context=context,
         )
-        if should_review:
-            execution, review_results, extra_results = self._review_and_revise(
-                original_request=request,
-                step=None,
-                execution=execution,
-                context=context,
-            )
-            reviews.extend(review_results)
-            all_results.extend(extra_results)
+        all_results.extend(extra_results)
         result = _merge_results(all_results, execution.content)
         result.workflow = {
             "mode": "react",
@@ -622,12 +592,10 @@ class WorkflowOrchestrator:
         request: str,
         context: Sequence[Message],
         assessment: ComplexityAssessment,
-        prior_results: Optional[List[AgentResult]] = None,
-        planning_request: Optional[str] = None,
     ) -> AgentResult:
         self._emit("planning_started", message="Planner 正在调查项目并制定计划")
         plan, planning_result = self.planner.create(
-            planning_request or request,
+            request,
             context,
             root_requirement=self._root_requirement,
         )
@@ -653,7 +621,7 @@ class WorkflowOrchestrator:
                 "reviews": [],
             }
         )
-        all_results = [*(prior_results or []), planning_result]
+        all_results = [planning_result]
         reviews: List[Dict[str, Any]] = []
         step_records = []
         completed_summaries: List[Dict[str, str]] = []
@@ -681,20 +649,6 @@ class WorkflowOrchestrator:
             )
             execution = self._execute(step_request, context)
             all_results.append(execution)
-            execution, step_reviews, extra_results = self._review_and_revise(
-                original_request=request,
-                step=step,
-                execution=execution,
-                context=context,
-            )
-            all_results.extend(extra_results)
-            reviews.extend(
-                {
-                    "scope": step.step_id,
-                    **asdict(review),
-                }
-                for review in step_reviews
-            )
             step.status = "completed"
             self._emit(
                 "step_completed",
@@ -716,7 +670,7 @@ class WorkflowOrchestrator:
                     "step_id": step.step_id,
                     "status": step.status,
                     "result": execution.content[:4_000],
-                    "revisions": max(0, len(step_reviews) - 1),
+                    "revisions": 0,
                 }
             )
             self._workflow_state.update(
@@ -814,6 +768,7 @@ class WorkflowOrchestrator:
             "plan": _plan_dict(plan),
             "steps": step_records,
             "reviews": reviews,
+            "final_revisions": final_revisions,
             "iteration_budget": self._budget_dict(),
         }
         self._emit("workflow_completed", message="计划、执行与评审已全部完成")
@@ -1102,42 +1057,3 @@ def _positive_int(value: Any, default: int) -> int:
     if isinstance(value, int) and value > 0:
         return value
     return default
-
-
-def _plan_escalation(content: str) -> Optional[Dict[str, Any]]:
-    try:
-        data = _extract_json_object(content)
-    except WorkflowError:
-        return None
-    if data.get("workflow_request") != "plan_and_act":
-        return None
-    objective = data.get("objective")
-    if not isinstance(objective, str) or not objective.strip():
-        return None
-    return data
-
-
-def _runtime_complexity_reasons(result: AgentResult) -> List[str]:
-    changed_paths = set()
-    failed_validations = 0
-    for execution in result.tool_executions:
-        if execution.name == "apply_patch":
-            try:
-                arguments = json.loads(execution.arguments)
-            except json.JSONDecodeError:
-                arguments = {}
-            path = arguments.get("path") if isinstance(arguments, dict) else None
-            if isinstance(path, str):
-                changed_paths.add(path)
-        elif execution.name == "run_command" and "Exit code: 0" not in execution.result:
-            failed_validations += 1
-    reasons = []
-    if len(changed_paths) >= 3:
-        reasons.append("ReAct 已涉及至少三个修改文件")
-    if failed_validations >= 2:
-        reasons.append("ReAct 中出现多次验证失败")
-    if len(result.tool_executions) >= 8:
-        reasons.append("ReAct 工具调用数量达到复杂任务阈值")
-    if result.compactions >= 2:
-        reasons.append("ReAct 上下文多次压缩")
-    return reasons

@@ -3,7 +3,7 @@
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .context import ContextManager
 from .llm import ChatModel, Message
@@ -70,14 +70,14 @@ class Agent:
         self,
         llm: ChatModel,
         tools: ToolRegistry,
-        max_iterations: int = 64,
+        max_iterations: int = 16,
         system_prompt: str = SYSTEM_PROMPT,
         context_manager: Optional[ContextManager] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         progress_role: str = "executor",
         iteration_budget: Optional[IterationBudget] = None,
-        iteration_extension: int = 16,
-        stagnation_limit: int = 6,
+        iteration_extension: int = 4,
+        stagnation_limit: int = 3,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
@@ -129,6 +129,7 @@ class Agent:
         compactions = 0
         current_allowance = self.max_iterations
         seen_evidence: Set[str] = set()
+        read_cache: Dict[str, Tuple[str, str]] = {}
         stagnant_iterations = 0
         iteration = 0
         budget_warning_sent = False
@@ -225,6 +226,7 @@ class Agent:
                 ]
                 compactions += prepared.removed_blocks
                 if prepared.removed_blocks:
+                    read_cache.clear()
                     self._emit(
                         "context_compacted",
                         iteration=iteration,
@@ -275,10 +277,33 @@ class Agent:
                         tool=tool_call.function.name,
                         message=f"正在调用工具：{tool_call.function.name}",
                     )
-                    result = self.tools.execute(
+                    read_key, read_path = self._read_request(
                         tool_call.function.name,
                         tool_call.function.arguments,
                     )
+                    if read_key and read_key in read_cache:
+                        result = (
+                            "重复读取已跳过：该文件在本次执行中未发生修改。"
+                            "请复用此前 read_file 返回的内容。"
+                        )
+                    else:
+                        result = self.tools.execute(
+                            tool_call.function.name,
+                            tool_call.function.arguments,
+                        )
+                        if read_key and not result.startswith("Tool error:"):
+                            read_cache[read_key] = (read_path, result)
+                    changed_path = self._changed_path(
+                        tool_call.function.name,
+                        tool_call.function.arguments,
+                        result,
+                    )
+                    if changed_path:
+                        read_cache = {
+                            key: value
+                            for key, value in read_cache.items()
+                            if value[0] != changed_path
+                        }
                     evidence = self._evidence_fingerprint(
                         tool_call.function.name,
                         tool_call.function.arguments,
@@ -520,18 +545,56 @@ class Agent:
         current_scope: str,
         iteration: int,
     ) -> str:
-        root = root_requirement[:8_000]
-        scope = current_scope[:4_000]
+        root = root_requirement[:2_000]
+        scope = current_scope[:800]
         return (
-            f"任务锚点（第 {iteration} 次调用，本消息不是新需求）：\n"
-            f"<original_user_requirement>\n{root}\n"
-            "</original_user_requirement>\n"
-            f"<current_agent_scope>\n{scope}\n</current_agent_scope>\n"
-            "只执行能直接推进原始需求或其当前验收条件的动作。调用工具前先"
-            "确认该结果会改变实现决策、完成代码修改或验证结果；不要重复读取"
-            "已有证据，不要为了继续调查而调查。如果现有证据已经足够，立即"
-            "给出最终回复，不再调用工具。不要输出内部思维链。"
+            f"任务锚点（调用 {iteration}）：{root}\n"
+            f"当前范围：{scope}\n"
+            "保持当前已给定执行范围。只做能直接推进需求的动作；复用已有图谱、"
+            "文件和测试证据，禁止重复读取。如果现有证据已经足够，立即结束，"
+            "不输出思维链。"
         )
+
+    @staticmethod
+    def _read_request(
+        tool_name: str,
+        raw_arguments: str,
+    ) -> Tuple[str, str]:
+        if tool_name != "read_file":
+            return "", ""
+        try:
+            arguments = json.loads(raw_arguments or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return "", ""
+        if not isinstance(arguments, dict):
+            return "", ""
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path:
+            return "", ""
+        key = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return key, path
+
+    @staticmethod
+    def _changed_path(
+        tool_name: str,
+        raw_arguments: str,
+        result: str,
+    ) -> str:
+        if tool_name != "apply_patch" or result.startswith("Tool error:"):
+            return ""
+        try:
+            arguments = json.loads(raw_arguments or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        if not isinstance(arguments, dict):
+            return ""
+        path = arguments.get("path")
+        return path if isinstance(path, str) else ""
 
     @staticmethod
     def _evidence_fingerprint(

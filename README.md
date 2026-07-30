@@ -17,8 +17,8 @@
 - 创建新文件或精确替换已有文本
 - 运行受控的测试、构建和静态检查命令
 - 按需将完整执行过程保存为 JSON
-- 请求前估算上下文 Token，并在 80K 时安全压缩旧工具交互
-- 将输入限制在 96K、输出限制在 16K，总预算为 128K
+- 请求前估算上下文 Token，并在 64K 时安全压缩旧工具交互
+- 将输入限制在 96K、输出限制在 8K，总预算为 128K
 - 将单次需求工作上下文与跨需求项目记忆分离
 - 自动保存任务摘要，并按需检索详细情景记忆
 - 导入多格式项目资料并构建本地 RAG 知识库
@@ -95,9 +95,10 @@ Web 服务、工具执行和持久化数据位于本机，服务只允许绑定 
 simple-agent --workspace /path/to/project "分析项目结构"
 ```
 
-默认使用 `auto` 模式：小型任务直接进入 ReAct；复杂任务会先由只读 Planner
-调查仓库并生成结构化计划，再为每个步骤创建隔离的 Executor，最后由只读
-Reflection Reviewer 检查需求、代码和验证证据。
+默认使用 `auto` 模式：编排器在任务开始时只做一次路由，小型任务进入 ReAct，
+复杂任务进入 Plan-and-Act。执行过程中模式固定，不会把已经执行过的 ReAct
+从头升级并重新规划。两种模式都只在整个任务执行完成后，由只读 Reflection
+Reviewer 根据需求、代码和验证证据做一次总体验收。
 
 ```bash
 # 强制使用普通 ReAct
@@ -107,8 +108,8 @@ simple-agent --agent-mode react "修正 README 中的错别字"
 simple-agent --agent-mode plan "重构认证模块并完成数据库迁移"
 ```
 
-普通 ReAct 执行过程中如果发现新的复杂子任务，也可以向顶层编排器申请一次
-Plan-and-Act 升级。编排器不允许子 Agent 继续递归创建 Agent。
+`react` 和 `plan` 可用于显式覆盖自动选择。编排器不允许子 Agent 继续递归创建
+Agent，也不会在任务中途切换工作流模式。
 
 角色权限：
 
@@ -316,18 +317,18 @@ LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
 LLM_API_KEY=your-api-key
 LLM_CONTEXT_WINDOW=128000
 LLM_MAX_INPUT_TOKENS=96000
-LLM_MAX_OUTPUT_TOKENS=16000
-AGENT_COMPACT_AT_TOKENS=80000
+LLM_MAX_OUTPUT_TOKENS=8000
+AGENT_COMPACT_AT_TOKENS=64000
 AGENT_MODE=auto
-AGENT_MAX_ITERATIONS=64
-AGENT_TOTAL_ITERATION_BUDGET=96
-AGENT_ITERATION_EXTENSION=16
-AGENT_STAGNATION_LIMIT=6
+AGENT_MAX_ITERATIONS=16
+AGENT_TOTAL_ITERATION_BUDGET=24
+AGENT_ITERATION_EXTENSION=4
+AGENT_STAGNATION_LIMIT=3
 AGENT_PLAN_COMPLEXITY_THRESHOLD=3
-AGENT_MAX_PLAN_STEPS=12
-AGENT_MAX_STEP_REVISIONS=2
-AGENT_PLANNER_MAX_ITERATIONS=24
-AGENT_REVIEWER_MAX_ITERATIONS=24
+AGENT_MAX_PLAN_STEPS=4
+AGENT_MAX_STEP_REVISIONS=1
+AGENT_PLANNER_MAX_ITERATIONS=4
+AGENT_REVIEWER_MAX_ITERATIONS=4
 ```
 
 `AGENT_MAX_ITERATIONS` 是每个 Executor 的初始执行额度，不再是固定终止上限；
@@ -338,7 +339,7 @@ Agent 仍在读取新的证据、产生新的代码修改或获得新的测试�
 连续 `AGENT_STAGNATION_LIMIT` 轮只得到重复工具结果或工具参数错误时，系统才会
 认定 Agent 陷入无进展循环并停止。`AGENT_TOTAL_ITERATION_BUDGET` 是整个需求中
 所有 Planner、Executor、Reviewer 和最终结果整理共享、不可突破的模型调用硬
-上限，默认 96 次。预算进入最后约 20%（最多保留 12 次）时，系统会向当前 Agent
+上限，默认 24 次。预算进入最后约 20%（最多保留 12 次）时，系统会向当前 Agent
 注入收敛指令，要求停止扩展调查范围，优先完成必要修改与验证，或明确报告阻塞。
 其中最后 1 次调用专门保留给无工具的最终答复：达到硬上限或检测到停滞时，
 系统会停止后续规划与评审，要求模型根据已有证据说明完成情况、验证结果和未完成

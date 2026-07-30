@@ -39,7 +39,7 @@ LLM_API_KEY=your-api-key
       "content": "实现健康检查接口"
     }
   ],
-  "max_tokens": 16000,
+  "max_tokens": 8000,
   "tools": [
     {
       "type": "function",
@@ -140,7 +140,7 @@ Tool error: unknown tool 'delete_everything'
 
 ## 调用预算和强制回答
 
-默认每个需求共享 96 次模型调用。普通工具循环最多使用前 95 次，最后一次保留给
+默认每个需求共享 24 次模型调用。普通工具循环最多使用前 23 次，最后一次保留给
 禁止工具的最终回答。
 
 以下情况会触发强制回答：

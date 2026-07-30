@@ -23,10 +23,10 @@ from .vector_store import (
 from .workspace import Workspace
 
 MEMORY_VERSION = 2
-MAX_SUMMARY_CHARS = 1_200
-MAX_CONTEXT_CHARS = 12_000
-MAX_SESSION_SUMMARY_CHARS = 4_000
-MAX_CURRENT_REQUIREMENT_CHARS = 20_000
+MAX_SUMMARY_CHARS = 800
+MAX_CONTEXT_CHARS = 8_000
+MAX_SESSION_SUMMARY_CHARS = 2_000
+MAX_CURRENT_REQUIREMENT_CHARS = 8_000
 VALID_MEMORY_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
@@ -454,19 +454,19 @@ class ContextBuilder:
     def __init__(
         self,
         store: ProjectMemoryStore,
-        recent_limit: int = 5,
-        relevant_limit: int = 3,
-        cross_session_limit: int = 3,
+        recent_limit: int = 3,
+        relevant_limit: int = 2,
+        cross_session_limit: int = 1,
         max_context_chars: int = MAX_CONTEXT_CHARS,
         knowledge_base: Optional[KnowledgeBase] = None,
-        knowledge_limit: int = 5,
-        max_knowledge_chars: int = 10_000,
+        knowledge_limit: int = 3,
+        max_knowledge_chars: int = 6_000,
         project_index: Optional[ProjectIndex] = None,
-        project_index_limit: int = 6,
-        max_project_index_chars: int = 14_000,
+        project_index_limit: int = 4,
+        max_project_index_chars: int = 8_000,
         project_graph: Optional[ProjectGraph] = None,
-        project_graph_limit: int = 6,
-        max_project_graph_chars: int = 12_000,
+        project_graph_limit: int = 4,
+        max_project_graph_chars: int = 6_000,
     ) -> None:
         self.store = store
         self.recent_limit = recent_limit
@@ -676,22 +676,22 @@ class ContextBuilder:
         for profile in profiles:
             record = profile_to_dict(profile)
             rendered = json.dumps(record, ensure_ascii=False)
-            if records and used_chars + len(rendered) > 8_000:
+            if records and used_chars + len(rendered) > 4_000:
                 break
             records.append(record)
             used_chars += len(rendered)
         relations = []
-        for profile in profiles[:2]:
+        for profile in profiles[:1]:
             graph = self.project_graph.neighbors(
                 profile.path,
                 depth=1,
-                limit=40,
+                limit=20,
             )
-            relations.extend(graph["edges"][:40])
+            relations.extend(graph["edges"][:20])
         data = {
-            "graph_overview": self.project_graph.overview(max_profiles=20),
+            "graph_overview": self.project_graph.overview(max_profiles=8),
             "relevant_file_profiles": records,
-            "relevant_relations": relations[:80],
+            "relevant_relations": relations[:20],
         }
         content = (
             "下面是工作区共享的 Neo4j 项目知识图谱。文件功能档案由 LLM 根据"
@@ -721,14 +721,14 @@ class ContextBuilder:
         assert self.project_index is not None
         overview = self.project_index.overview(
             max_depth=2,
-            max_entries=120,
+            max_entries=60,
         )
         records = []
         used_chars = 0
         for hit in hits:
             record = project_hit_to_dict(hit)
             rendered = json.dumps(record, ensure_ascii=False)
-            if records and used_chars + len(rendered) > 8_000:
+            if records and used_chars + len(rendered) > 4_000:
                 break
             records.append(record)
             used_chars += len(rendered)

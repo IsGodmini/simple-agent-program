@@ -91,6 +91,32 @@ class AgentTests(unittest.TestCase):
             self.assertIn("实现用户登录并通过测试", reminder)
             self.assertIn("只检查配置文件", reminder)
 
+    def test_duplicate_unchanged_file_read_is_skipped(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("value = 1\n", encoding="utf-8")
+            registry = ToolRegistry([ReadFileTool(Workspace(root))])
+            repeated = {"path": "app.py"}
+            llm = FakeLLM(
+                [
+                    assistant_message(
+                        tool_calls=[tool_call("read-1", "read_file", repeated)]
+                    ),
+                    assistant_message(
+                        tool_calls=[tool_call("read-2", "read_file", repeated)]
+                    ),
+                    assistant_message(content="完成"),
+                ]
+            )
+
+            result = Agent(llm, registry).run("检查 app.py")
+
+            self.assertIn("value = 1", result.tool_executions[0].result)
+            self.assertIn(
+                "重复读取已跳过",
+                result.tool_executions[1].result,
+            )
+
     def test_agent_reports_model_and_tool_progress(self):
         with TemporaryDirectory() as directory:
             registry = ToolRegistry([ListFilesTool(Workspace(Path(directory)))])

@@ -46,14 +46,14 @@ LLM_API_KEY=...
 
 - 每轮原始需求和当前子任务提醒；
 - 连续无新证据停滞检测；
-- 默认 96 次需求级共享硬上限；
+- 默认 24 次需求级共享硬上限；
 - 最后一次无工具最终回答。
 
 可以降低：
 
 ```env
-AGENT_TOTAL_ITERATION_BUDGET=48
-AGENT_STAGNATION_LIMIT=4
+AGENT_TOTAL_ITERATION_BUDGET=16
+AGENT_STAGNATION_LIMIT=2
 ```
 
 过低会使大型改造在完成测试前收尾。查看 Web 进度中的

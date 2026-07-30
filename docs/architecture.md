@@ -66,9 +66,9 @@ SessionManager.complete_task
 LLM → tool_calls → 本地工具 → tool 消息 → LLM
 ```
 
-如果没有修改文件或运行命令，通常直接返回结果。发生修改或验证后，编排器会调用
-只读 Reflection Reviewer。普通 ReAct 若发现一个新的复杂子任务，可申请一次
-Plan-and-Act 升级；子 Agent 不能递归创建更多编排器。
+Executor 完成后，编排器调用一次只读 Reflection Reviewer 做任务级验收。
+`auto` 只在任务开始时选择工作流；ReAct 执行中不会升级为 Plan-and-Act，
+从而避免重复规划和重读已经取得的证据。子 Agent 不能递归创建更多编排器。
 
 ## Plan-and-Act
 
@@ -76,10 +76,12 @@ Plan-and-Act 升级；子 Agent 不能递归创建更多编排器。
 
 1. Planner 使用只读工具调查项目，输出结构化无环计划。
 2. 编排器按依赖顺序执行每个步骤。
-3. 每个 Executor 只接收当前步骤、原始需求和已完成步骤摘要。
-4. Reviewer 根据当前文件、Git 差异和验证证据返回 `pass`、`revise` 或 `blocked`。
-5. `revise` 会触发有限次数修订。
-6. 全部步骤通过后，Synthesizer 整理最终回答。
+3. 每个 Executor 只接收当前步骤、原始需求和已完成步骤摘要；步骤之间连续执行，
+   不做逐步骤 Reflection。
+4. 全部步骤完成后，Reviewer 根据当前文件、Git 差异和验证证据做一次总体验收，
+   返回 `pass`、`revise` 或 `blocked`。
+5. `revise` 会触发有限次数的任务级修订。
+6. 验收完成后，Synthesizer 整理最终回答。
 
 Planner 和 Reviewer 没有 `apply_patch`。Reviewer 使用比 Executor 更严格的只读
 命令工具。
@@ -131,8 +133,8 @@ Planner 和 Reviewer 没有 `apply_patch`。Reviewer 使用比 Executor 更严�
   "status": "stopped_with_answer",
   "stop_reason": "budget_exhausted",
   "iteration_budget": {
-    "used": 96,
-    "maximum": 96,
+    "used": 24,
+    "maximum": 24,
     "remaining": 0
   }
 }

@@ -107,10 +107,12 @@ class ComplexityRouterTests(unittest.TestCase):
             "重构系统架构，同时迁移数据库，并且更新多个模块的安全权限"
         )
         multi_surface = router.assess("实现登录接口，同时添加完整测试")
+        expansion = router.assess("你可以拓展一下项目功能吗")
 
         self.assertEqual(simple.mode, "react")
         self.assertEqual(complex_task.mode, "plan_and_act")
         self.assertEqual(multi_surface.mode, "plan_and_act")
+        self.assertEqual(expansion.mode, "plan_and_act")
         self.assertGreaterEqual(complex_task.score, 3)
 
     def test_forced_mode_overrides_complexity(self):
@@ -223,7 +225,12 @@ class WorkflowOrchestratorTests(unittest.TestCase):
     def test_reports_routing_execution_and_completion_progress(self):
         with TemporaryDirectory() as directory:
             events = []
-            llm = FakeLLM([assistant_message(content="项目包含 README。")])
+            llm = FakeLLM(
+                [
+                    assistant_message(content="项目包含 README。"),
+                    assistant_message(content=review("pass")),
+                ]
+            )
 
             orchestrator(
                 Path(directory),
@@ -238,9 +245,14 @@ class WorkflowOrchestratorTests(unittest.TestCase):
             self.assertIn("model_started", names)
             self.assertEqual(names[-1], "workflow_completed")
 
-    def test_simple_read_only_task_stays_in_react_without_reflection(self):
+    def test_simple_read_only_task_stays_in_react_with_one_reflection(self):
         with TemporaryDirectory() as directory:
-            llm = FakeLLM([assistant_message(content="项目包含 README。")])
+            llm = FakeLLM(
+                [
+                    assistant_message(content="项目包含 README。"),
+                    assistant_message(content=review("pass")),
+                ]
+            )
 
             result = orchestrator(Path(directory), llm, mode="react").run(
                 "项目里有什么？"
@@ -248,12 +260,12 @@ class WorkflowOrchestratorTests(unittest.TestCase):
 
             self.assertEqual(result.content, "项目包含 README。")
             self.assertEqual(result.workflow["mode"], "react")
-            self.assertEqual(result.workflow["reviews"], [])
+            self.assertEqual(len(result.workflow["reviews"]), 1)
             self.assertEqual(
                 result.workflow["iteration_budget"],
-                {"used": 1, "maximum": 96, "remaining": 95},
+                {"used": 2, "maximum": 24, "remaining": 22},
             )
-            self.assertEqual(len(llm.requests), 1)
+            self.assertEqual(len(llm.requests), 2)
 
     def test_react_mutation_is_reviewed_before_completion(self):
         with TemporaryDirectory() as directory:
@@ -288,9 +300,9 @@ class WorkflowOrchestratorTests(unittest.TestCase):
                 ["apply_patch"],
             )
 
-    def test_react_can_escalate_one_discovered_complex_subtask(self):
+    def test_auto_mode_never_changes_after_initial_routing(self):
         with TemporaryDirectory() as directory:
-            escalation = json.dumps(
+            attempted_escalation = json.dumps(
                 {
                     "workflow_request": "plan_and_act",
                     "objective": "迁移认证数据并保持兼容",
@@ -300,12 +312,8 @@ class WorkflowOrchestratorTests(unittest.TestCase):
             )
             llm = FakeLLM(
                 [
-                    assistant_message(content=escalation),
-                    assistant_message(content=one_step_plan()),
-                    assistant_message(content="迁移已完成。"),
+                    assistant_message(content=attempted_escalation),
                     assistant_message(content=review("pass")),
-                    assistant_message(content=review("pass")),
-                    assistant_message(content="升级规划后完成。"),
                 ]
             )
 
@@ -313,22 +321,16 @@ class WorkflowOrchestratorTests(unittest.TestCase):
                 "调整登录行为"
             )
 
-            self.assertEqual(result.workflow["mode"], "plan_and_act")
-            self.assertTrue(
-                any(
-                    "Executor 请求规划复杂子任务" in reason
-                    for reason in result.workflow["assessment"]["reasons"]
-                )
-            )
-            self.assertEqual(result.content, "升级规划后完成。")
+            self.assertEqual(result.workflow["mode"], "react")
+            self.assertEqual(len(llm.requests), 2)
+            self.assertEqual(result.content, attempted_escalation)
 
-    def test_complex_task_runs_plan_step_reviews_and_synthesis(self):
+    def test_complex_task_runs_one_final_review_and_synthesis(self):
         with TemporaryDirectory() as directory:
             llm = FakeLLM(
                 [
                     assistant_message(content=one_step_plan()),
                     assistant_message(content="核心功能已完成。"),
-                    assistant_message(content=review("pass")),
                     assistant_message(content=review("pass")),
                     assistant_message(content="复杂改造已经完成并通过评审。"),
                 ]
@@ -343,7 +345,7 @@ class WorkflowOrchestratorTests(unittest.TestCase):
                 result.workflow["plan"]["steps"][0]["status"],
                 "completed",
             )
-            self.assertEqual(len(result.workflow["reviews"]), 2)
+            self.assertEqual(len(result.workflow["reviews"]), 1)
             self.assertEqual(
                 result.content,
                 "复杂改造已经完成并通过评审。",
@@ -354,7 +356,7 @@ class WorkflowOrchestratorTests(unittest.TestCase):
                     ensure_ascii=False,
                 )
                 self.assertIn("完成复杂改造", serialized)
-                self.assertIn("只执行能直接推进原始需求", serialized)
+                self.assertIn("只做能直接推进需求的动作", serialized)
 
     def test_revise_verdict_creates_one_bounded_repair(self):
         with TemporaryDirectory() as directory:
@@ -371,7 +373,6 @@ class WorkflowOrchestratorTests(unittest.TestCase):
                     assistant_message(content=review("revise", [finding])),
                     assistant_message(content="已补充边界测试。"),
                     assistant_message(content=review("pass")),
-                    assistant_message(content=review("pass")),
                     assistant_message(content="修正后完成。"),
                 ]
             )
@@ -383,10 +384,10 @@ class WorkflowOrchestratorTests(unittest.TestCase):
                 revisions=1,
             ).run("完成复杂改造")
 
-            self.assertEqual(result.workflow["steps"][0]["revisions"], 1)
+            self.assertEqual(result.workflow["final_revisions"], 1)
             self.assertEqual(
                 [item["verdict"] for item in result.workflow["reviews"]],
-                ["revise", "pass", "pass"],
+                ["revise", "pass"],
             )
 
     def test_revision_limit_blocks_unverified_completion(self):
@@ -413,7 +414,7 @@ class WorkflowOrchestratorTests(unittest.TestCase):
             )
             self.assertEqual(
                 raised.exception.workflow["plan"]["steps"][0]["status"],
-                "running",
+                "completed",
             )
 
     def test_planner_and_reviewer_do_not_receive_write_tools(self):
