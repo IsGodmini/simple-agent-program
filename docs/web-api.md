@@ -23,7 +23,8 @@ http://127.0.0.1:8765/api/docs
 - Job 状态为 `queued`、`running`、`completed` 或 `failed`。
 - 同一工作区的 Job 串行执行；不同工作区最多并行使用 4 个线程。
 - 每个 Job 最多保留最近 200 条进度事件。
-- Job 记录在内存中，服务重启后丢失；已完成需求的 Episode 持久化在工作区。
+- Job 记录在内存中，服务重启后丢失；已完成需求的 Episode 持久化在该项目的
+  系统存储区域。
 
 ## 接口一览
 
@@ -68,8 +69,21 @@ GET /api/bootstrap
 GET /api/workspace?path=/path/to/project
 ```
 
-返回规范化路径、会话、知识文档和项目索引状态。首次打开空工作区时会创建
-`default` 会话。
+返回规范化路径、项目系统存储位置、会话、知识文档和项目索引状态。存储字段示例：
+
+```json
+{
+  "storage": {
+    "home": "/Users/name/.simple-agent",
+    "project_id": "24-character-project-id",
+    "project_root": "/Users/name/.simple-agent/projects/24-character-project-id",
+    "customized": false,
+    "legacy_storage_present": false
+  }
+}
+```
+
+首次打开空工作区时会创建 `default` 会话。
 
 创建会话：
 

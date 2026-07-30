@@ -1,3 +1,5 @@
+from tests import _TEST_STORAGE_HOME  # noqa: F401
+
 import json
 import unittest
 from argparse import Namespace
@@ -417,6 +419,59 @@ class LLMProfileGeneratorTests(unittest.TestCase):
 
         self.assertEqual(profiles[0].purpose, "启动 HTTP 服务并装配路由。")
         self.assertEqual(profiles[0].profile_version, 2)
+
+    def test_retries_only_incomplete_batch_items_as_single_files(self):
+        class FakeModel:
+            def __init__(self):
+                self.paths = []
+
+            def complete(self, messages, tools=None):
+                records = json.loads(messages[-1]["content"])
+                self.paths.append([record["path"] for record in records])
+                if len(records) == 2:
+                    result = [
+                        {
+                            "path": "app.py",
+                            "purpose": "启动应用。",
+                            "responsibilities": ["创建应用"],
+                        },
+                        {
+                            "path": "verify.py",
+                            "purpose": "",
+                            "responsibilities": [],
+                        },
+                    ]
+                else:
+                    result = [
+                        {
+                            "path": records[0]["path"],
+                            "purpose": "验证服务启动状态。",
+                            "responsibilities": ["执行启动检查"],
+                        }
+                    ]
+                return SimpleNamespace(content=json.dumps(result))
+
+        model = FakeModel()
+        records = [
+            {
+                "path": path,
+                "content_hash": path,
+                "language": "Python",
+                "line_count": 10,
+                "symbols": [],
+                "imports": [],
+                "leading_content": "pass",
+            }
+            for path in ("app.py", "verify.py")
+        ]
+
+        profiles = LLMFileProfileGenerator(model).generate(records, {}, "now")
+
+        self.assertEqual(model.paths, [["app.py", "verify.py"], ["verify.py"]])
+        self.assertEqual(
+            [profile.path for profile in profiles],
+            ["app.py", "verify.py"],
+        )
 
 
 class Neo4jStoreTests(unittest.TestCase):

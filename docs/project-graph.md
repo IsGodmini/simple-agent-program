@@ -64,7 +64,7 @@ NEO4J_DATABASE=neo4j
 Chroma 数据位于：
 
 ```text
-.simple-agent/vector/
+~/.simple-agent/projects/<project-id>/vector/
 ```
 
 集合按工作区和数据类型隔离：
@@ -119,5 +119,5 @@ POST /api/project-graph/refresh?workspace=/path/to/project
 失败、LLM 档案生成失败或事务失败会写入 `last_error`。向量状态独立显示是否启用、
 Embedding 模型和本地 Chroma 路径。
 
-旧版本可能遗留 `.simple-agent/graph/project-graph.db`；新代码不会读取或更新它。
-确认不需要回退旧版本后可以手动删除 `.simple-agent/graph/`。
+旧版本可能在工作区遗留 `.simple-agent/graph/project-graph.db`；新代码不会读取
+或更新它。确认系统级存储迁移成功且不需要回退后，可以手动删除旧目录。

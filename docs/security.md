@@ -72,11 +72,12 @@ Executor 只能通过 `apply_patch` 创建文件或进行唯一文本替换。�
 SQLite 和 JSON 状态文件没有加密：
 
 ```text
-.simple-agent/
+~/.simple-agent/projects/<project-id>/
 ```
 
 它们可能包含代码片段、用户需求、工具参数和命令输出。依赖操作系统文件权限保护，
-不要共享给无权访问项目的人。
+不要共享给无权访问项目的人。可通过 `SIMPLE_AGENT_HOME` 指定其他系统级存储根，
+但该目录必须位于项目工作区之外且不能是符号链接。
 
 文件路径、LLM 生成的功能档案、符号和依赖关系会发送到配置的 Neo4j 服务；项目
 不维护本地图谱副本。
@@ -84,7 +85,7 @@ SQLite 和 JSON 状态文件没有加密：
 账号和网络访问控制。模型不能执行任意 Cypher；Neo4j 不可用时图谱功能不可用。
 
 Embedding 只允许连接本机 Ollama 回环地址。代码块、知识片段、文件档案和记忆摘要
-不会发送给远程 Embedding 服务；向量和相应原文保存在工作区本地 Chroma。代码会
+不会发送给远程 Embedding 服务；向量和相应原文保存在项目独立的系统级 Chroma。代码会
 拒绝非 `localhost`、`127.0.0.1` 或 `::1` 的 Embedding Base URL。
 
 ## Web 服务

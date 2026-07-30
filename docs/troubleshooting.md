@@ -114,8 +114,8 @@ simple-agent --workspace /path/to/project --index-status
 
 1. 检查文件是否超过 2 MiB、属于二进制或不支持的扩展名。
 2. 检查文件是否位于 `node_modules`、`dist`、`.venv` 等跳过目录。
-3. 确认 `.simple-agent/index` 不是符号链接。
-4. 可在停止服务后删除 `.simple-agent/index/`，下次需求会完整重建。
+3. 确认 `$SIMPLE_AGENT_HOME/projects/<project-id>/index` 不是符号链接。
+4. 可在停止服务后删除对应项目的 `index/`，下次需求会完整重建。
 
 删除索引不会删除源码、会话、知识库或 Episode。
 
@@ -133,8 +133,8 @@ simple-agent --workspace /path/to/project --graph-status
 3. 查看状态中的 `neo4j_last_error`；
 4. 修复连接后再次刷新，成功时间会写入 `neo4j_last_sync`。
 
-Neo4j 不可用不会使本地代码修改回滚，但文件档案和关系查询不可用。旧版本遗留的
-`.simple-agent/graph/` 不再被读取，确认无需回退后可手动删除。
+Neo4j 不可用不会使本地代码修改回滚，但文件档案和关系查询不可用。工作区中旧版本
+遗留的 `.simple-agent/graph/` 不再被读取，确认迁移后的系统存储可用后可手动删除。
 
 ## Chroma 向量检索未启用
 
@@ -146,8 +146,8 @@ ollama pull qwen3-embedding:0.6b
 
 检查 `EMBEDDING_MODEL` 和 `EMBEDDING_BASE_URL`。Base URL 必须是
 `http://127.0.0.1:11434/v1` 或等价回环地址，不需要 API Key。未配置模型时系统
-只执行 FTS5/BM25 关键词检索。配置后，变化内容会写入
-`.simple-agent/vector/`；本地 Embedding 调用失败不会删除已有关键词索引。
+只执行 FTS5/BM25 关键词检索。配置后，变化内容会写入当前项目系统存储中的
+`vector/`；本地 Embedding 调用失败不会删除已有关键词索引。
 
 ## 知识文档无法导入
 
@@ -190,7 +190,7 @@ GET /api/jobs/<job-id>
 
 ## 状态文件损坏
 
-操作前先备份 `.simple-agent/`。不同子目录可以独立重建：
+操作前先备份 `$SIMPLE_AGENT_HOME/projects/<project-id>/`。不同子目录可以独立重建：
 
 - `index/`：可删除并自动重建；
 - `vector/`：可删除并从源码、知识、档案和记忆重新生成；
@@ -198,3 +198,14 @@ GET /api/jobs/<job-id>
 - `memory/` 和 `episodes/`：删除会永久丢失会话和历史。
 
 不要在 Agent 或 Web Job 正在运行时修改这些文件。
+
+## 系统存储位置
+
+默认存储根目录是 `~/.simple-agent`。可以在 `.env` 或进程环境中修改：
+
+```bash
+SIMPLE_AGENT_HOME=/path/to/simple-agent-data
+```
+
+路径必须位于工作区之外。若目标工作区包含旧版 `.simple-agent/` 且新项目存储区
+尚不存在，系统会在首次访问时将旧数据复制到新位置；旧目录不会自动删除。

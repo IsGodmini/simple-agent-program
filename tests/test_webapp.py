@@ -1,3 +1,5 @@
+from tests import _TEST_STORAGE_HOME  # noqa: F401
+
 import tempfile
 import time
 import unittest
@@ -6,7 +8,9 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from simple_agent.agent import AgentResult
+from simple_agent.memory import ProjectMemoryStore
 from simple_agent.webapp import create_app
+from simple_agent.workspace import Workspace
 
 
 class _FakeAgent:
@@ -106,6 +110,10 @@ class WebAppTests(unittest.TestCase):
             params={"path": str(self.workspace)},
         )
         self.assertEqual(overview.status_code, 200)
+        self.assertEqual(
+            overview.json()["storage"]["project_root"],
+            str(ProjectMemoryStore(Workspace(self.workspace)).root),
+        )
         self.assertEqual(overview.json()["sessions"][0]["session_id"], "default")
 
         created = self.client.post(

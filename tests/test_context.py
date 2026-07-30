@@ -1,3 +1,5 @@
+from tests import _TEST_STORAGE_HOME  # noqa: F401
+
 import unittest
 from types import SimpleNamespace
 

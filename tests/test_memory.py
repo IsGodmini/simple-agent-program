@@ -1,3 +1,5 @@
+from tests import _TEST_STORAGE_HOME  # noqa: F401
+
 import json
 import unittest
 from pathlib import Path
@@ -370,9 +372,9 @@ class MemoryFilesystemIsolationTests(unittest.TestCase):
             root.mkdir()
             outside.mkdir()
             (root / ".simple-agent").symlink_to(outside, target_is_directory=True)
-            store = ProjectMemoryStore(Workspace(root))
 
             with self.assertRaisesRegex(ValueError, "symbolic links"):
+                store = ProjectMemoryStore(Workspace(root))
                 store.append_summary(
                     TaskSummary(
                         task_id="task-safe",

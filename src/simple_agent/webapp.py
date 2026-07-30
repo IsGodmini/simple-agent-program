@@ -29,6 +29,7 @@ from .memory import ProjectMemoryStore
 from .project_graph import ProjectGraph
 from .project_index import ProjectIndex
 from .session import SessionManager
+from .storage import ProjectStorage
 from .workspace import Workspace
 
 WEB_ROOT = Path(__file__).parent / "web"
@@ -317,6 +318,7 @@ def create_app(
             project_graph = ProjectGraph(workspace, project_index)
             return {
                 "path": str(workspace.root),
+                "storage": ProjectStorage(workspace).status(),
                 "sessions": [
                     asdict(session) for session in store.list_sessions()
                 ],

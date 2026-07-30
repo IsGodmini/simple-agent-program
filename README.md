@@ -74,7 +74,8 @@ simple-agent-web --workspace /path/to/project
 Web 服务、工具执行和持久化数据位于本机，服务只允许绑定 `127.0.0.1` 或
 `localhost`；选中的需求、代码片段和工具结果会发送到 `.env` 配置的远程 LLM
 服务。任务状态在页面中实时轮询；会话、需求摘要、场景记忆和知识库仍持久化在
-目标项目的 `.simple-agent/` 目录中。为了避免多个 Agent 同时修改同一个项目，
+系统级 `~/.simple-agent/projects/<project-id>/` 目录中，而不会写入目标项目。
+可通过 `SIMPLE_AGENT_HOME` 自定义系统存储根目录。为了避免多个 Agent 同时修改同一个项目，
 同一工作区提交的需求会串行执行。Web Job 只保存在当前进程内，服务重启后不会
 恢复排队或运行中的 Job。
 
@@ -187,9 +188,9 @@ simple-agent --workspace /path/to/project \
 旧版 DOC、PPT、XLS 需要先转换为对应的新版格式；扫描型 PDF 当前不包含 OCR，
 需要先转换为可搜索 PDF。单文件默认上限为 50 MiB，最多提取 200 万字符。
 
-文档会被解析、分块并写入项目的
-`.simple-agent/knowledge/knowledge.db`。关键词检索使用 SQLite FTS5/BM25；
-配置 Embedding 后，片段向量同时写入 `.simple-agent/vector/` 中的 Chroma，
+文档会被解析、分块并写入项目独立系统存储中的
+`knowledge/knowledge.db`。关键词检索使用 SQLite FTS5/BM25；
+配置 Embedding 后，片段向量同时写入该项目 `vector/` 中的 Chroma，
 检索结果通过 RRF 融合。每次新需求只自动注入少量相关片段，并保留
 `knowledge:<document-id>#chunk-<n>` 引用；完整知识库不会被塞入上下文。
 
@@ -198,7 +199,7 @@ simple-agent --workspace /path/to/project \
 项目首次收到需求时，会在本地构建工作区共享索引：
 
 ```text
-.simple-agent/index/
+~/.simple-agent/projects/<project-id>/index/
 ├── project-index.db
 └── repository-map.json
 ```
@@ -362,29 +363,33 @@ Planner、Executor、Reflection Reviewer、修复任务和最终结果整理始�
 构成临时工作上下文；需求结束后，只把紧凑摘要自动提供给同一会话的后续需求，
 原始过程不会自动进入新上下文。其他会话只能按相关性获得已完成场景记忆。
 
-本地工作区状态结构：
+默认系统状态结构：
 
 ```text
-.simple-agent/
-├── index/
-│   ├── project-index.db
-│   └── repository-map.json
-├── vector/
-│   └── <Chroma persistent data>
-├── knowledge/
-│   └── knowledge.db
-├── memory/
-│   ├── conversation_sessions.json
-│   └── task_summaries.json
-└── episodes/
-    └── <task-id>.json
+~/.simple-agent/
+└── projects/
+    └── <project-id>/
+        ├── index/
+        │   ├── project-index.db
+        │   └── repository-map.json
+        ├── vector/
+        │   └── <Chroma persistent data>
+        ├── knowledge/
+        │   └── knowledge.db
+        ├── memory/
+        │   ├── conversation_sessions.json
+        │   └── task_summaries.json
+        └── episodes/
+            └── <task-id>.json
 ```
 
 `conversation_sessions.json` 记录会话标题、会话摘要和需求 ID；
 `task_summaries.json` 记录每条需求所属的 `session_id`、结果、可信度、修改文件
 和验证命令。Episode 保存完整消息和工具执行过程，只能通过
-`search_memory` / `read_episode` 按需访问。
-`.simple-agent` 已被 Git 和普通文件工具忽略。
+`search_memory` / `read_episode` 按需访问。`project-id` 由规范化工作区路径生成，
+不同项目不会共用本地状态。设置 `SIMPLE_AGENT_HOME` 可以把整个系统存储根目录
+迁移到其他磁盘。若工作区存在旧版 `.simple-agent/`，首次访问会安全复制到新位置，
+旧目录保留供人工确认和清理。
 
 记忆可能落后于当前代码，因此 Agent 会把当前文件和测试结果作为最终事实来源。
 

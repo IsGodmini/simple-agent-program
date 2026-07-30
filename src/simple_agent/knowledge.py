@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from xml.etree import ElementTree
 
 from .workspace import Workspace
+from .storage import ProjectStorage
 from .vector_store import (
     ChromaVectorStore,
     VectorRecord,
@@ -430,7 +431,8 @@ class KnowledgeBase:
         if chunk_overlap < 0 or chunk_overlap >= chunk_chars:
             raise ValueError("chunk_overlap must be between 0 and chunk_chars")
         self.workspace = workspace
-        self.root = workspace.root / ".simple-agent" / "knowledge"
+        self.storage = ProjectStorage(workspace)
+        self.root = self.storage.root / "knowledge"
         self.database_path = self.root / "knowledge.db"
         self.parser = parser or DocumentParser()
         self.chunk_chars = chunk_chars
@@ -835,19 +837,7 @@ class KnowledgeBase:
         return connection
 
     def _ensure_storage_path(self) -> None:
-        paths = [
-            self.workspace.root / ".simple-agent",
-            self.root,
-            self.database_path,
-        ]
-        if any(path.is_symlink() for path in paths if path.exists()):
-            raise ValueError("knowledge paths cannot contain symbolic links")
-        try:
-            self.database_path.resolve(strict=False).relative_to(
-                self.workspace.root
-            )
-        except ValueError as exc:
-            raise ValueError("knowledge path is outside the workspace") from exc
+        self.storage.ensure_path(self.database_path, "knowledge")
 
     @staticmethod
     def _validate_document_id(document_id: str) -> None:

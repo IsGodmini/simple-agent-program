@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from .knowledge import KnowledgeBase, KnowledgeHit, hit_to_dict
+from .storage import ProjectStorage
 from .llm import Message
 from .project_graph import FileProfile, ProjectGraph, profile_to_dict
 from .project_index import ProjectCodeHit, ProjectIndex, project_hit_to_dict
@@ -87,7 +88,8 @@ class ProjectMemoryStore:
         vector_store: Optional[ChromaVectorStore] = None,
     ) -> None:
         self.workspace = workspace
-        self.root = workspace.root / ".simple-agent"
+        self.storage = ProjectStorage(workspace)
+        self.root = self.storage.root
         self.memory_dir = self.root / "memory"
         self.episodes_dir = self.root / "episodes"
         self.summaries_path = self.memory_dir / "task_summaries.json"
@@ -443,24 +445,7 @@ class ProjectMemoryStore:
         temporary_path.replace(path)
 
     def _ensure_storage_path(self, path: Path) -> None:
-        try:
-            path.relative_to(self.root)
-        except ValueError as exc:
-            raise ValueError("memory path is outside the memory root") from exc
-
-        current = self.root
-        paths_to_check = [current]
-        for part in path.relative_to(self.root).parts:
-            current = current / part
-            paths_to_check.append(current)
-        if any(item.is_symlink() for item in paths_to_check if item.exists()):
-            raise ValueError("memory paths cannot contain symbolic links")
-
-        resolved = path.resolve(strict=False)
-        try:
-            resolved.relative_to(self.workspace.root)
-        except ValueError as exc:
-            raise ValueError("memory path is outside the workspace") from exc
+        self.storage.ensure_path(path, "memory")
 
 
 class ContextBuilder:

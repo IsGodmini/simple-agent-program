@@ -11,6 +11,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from .workspace import Workspace
+from .storage import ProjectStorage
 
 
 class EmbeddingProvider(Protocol):
@@ -87,11 +88,10 @@ class ChromaVectorStore:
         client: Optional[Any] = None,
     ) -> None:
         self.workspace = workspace
+        self.storage = ProjectStorage(workspace)
         self.provider = provider
-        self.root = workspace.root / ".simple-agent" / "vector"
-        self.workspace_id = hashlib.sha256(
-            str(workspace.root).encode("utf-8")
-        ).hexdigest()[:16]
+        self.root = self.storage.root / "vector"
+        self.workspace_id = self.storage.project_id[:16]
         self._client = client
 
     @classmethod
@@ -283,13 +283,7 @@ class ChromaVectorStore:
             )
 
     def _ensure_storage_path(self) -> None:
-        paths = [self.workspace.root / ".simple-agent", self.root]
-        if any(path.is_symlink() for path in paths if path.exists()):
-            raise ValueError("vector store paths cannot contain symbolic links")
-        try:
-            self.root.resolve(strict=False).relative_to(self.workspace.root)
-        except ValueError as exc:
-            raise ValueError("vector store path is outside workspace") from exc
+        self.storage.ensure_path(self.root, "vector store")
 
 
 def reciprocal_rank_fusion(

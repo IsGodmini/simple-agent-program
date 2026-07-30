@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .workspace import Workspace
+from .storage import ProjectStorage
 from .vector_store import (
     ChromaVectorStore,
     VectorRecord,
@@ -203,7 +204,8 @@ class ProjectIndex:
         if chunk_chars < 500:
             raise ValueError("chunk_chars must be at least 500")
         self.workspace = workspace
-        self.root = workspace.root / ".simple-agent" / "index"
+        self.storage = ProjectStorage(workspace)
+        self.root = self.storage.root / "index"
         self.database_path = self.root / "project-index.db"
         self.map_path = self.root / "repository-map.json"
         self.max_file_bytes = max_file_bytes
@@ -1120,20 +1122,8 @@ class ProjectIndex:
         return connection
 
     def _ensure_storage_path(self) -> None:
-        paths = [
-            self.workspace.root / ".simple-agent",
-            self.root,
-            self.database_path,
-            self.map_path,
-        ]
-        if any(path.is_symlink() for path in paths if path.exists()):
-            raise ValueError("project index paths cannot contain symbolic links")
-        try:
-            self.database_path.resolve(strict=False).relative_to(
-                self.workspace.root
-            )
-        except ValueError as exc:
-            raise ValueError("project index path is outside the workspace") from exc
+        self.storage.ensure_path(self.database_path, "project index")
+        self.storage.ensure_path(self.map_path, "project index")
 
     def _is_denied(self, path: Path) -> bool:
         try:

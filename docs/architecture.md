@@ -86,31 +86,34 @@ Planner 和 Reviewer 没有 `apply_patch`。Reviewer 使用比 Executor 更严�
 
 ## 持久化状态
 
-每个工作区都有独立状态：
+每个工作区在系统存储根目录下都有独立状态。默认根目录为
+`~/.simple-agent`，可通过 `SIMPLE_AGENT_HOME` 自定义：
 
 ```text
-.simple-agent/
-├── index/
-│   ├── project-index.db
-│   └── repository-map.json
-├── vector/
-│   └── <Chroma persistent data>
-├── knowledge/
-│   └── knowledge.db
-├── memory/
-│   ├── conversation_sessions.json
-│   └── task_summaries.json
-└── episodes/
-    └── <requirement-id>.json
+<SIMPLE_AGENT_HOME>/
+└── projects/
+    └── <project-id>/
+        ├── index/
+        │   ├── project-index.db
+        │   └── repository-map.json
+        ├── vector/
+        │   └── <Chroma persistent data>
+        ├── knowledge/
+        │   └── knowledge.db
+        ├── memory/
+        │   ├── conversation_sessions.json
+        │   └── task_summaries.json
+        └── episodes/
+            └── <requirement-id>.json
 ```
 
-这些文件不会进入 Git，也不会被普通文件工具返回。SQLite 保存源码/知识关键词
+这些文件位于工作区之外，不会进入项目 Git，也不会被普通文件工具返回。SQLite 保存源码/知识关键词
 索引，Chroma 保存向量，Neo4j 是工作区关系图和文件档案的唯一存储。会话和需求
 摘要使用 JSON。
 
 ## 隔离和并发
 
-- 不同工作区的索引、知识库、会话和 Episode 完全隔离。
+- 不同工作区映射到不同 `project-id`，索引、知识库、会话和 Episode 完全隔离。
 - 同一工作区的不同会话共享项目索引、知识库和相关场景记忆。
 - 同一会话连续需求会继承会话摘要和最近需求摘要。
 - Web 后台最多使用 4 个工作线程，但同一工作区通过互斥锁串行执行，避免两个

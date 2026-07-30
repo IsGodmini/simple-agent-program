@@ -1,6 +1,5 @@
 """Neo4j project graph with LLM-generated file profiles."""
 
-import hashlib
 import json
 import os
 import re
@@ -16,6 +15,7 @@ from dotenv import load_dotenv
 from .config import Settings
 from .llm import ChatModel, OpenAICompatibleLLM
 from .project_index import ProjectIndex
+from .storage import ProjectStorage
 from .vector_store import (
     ChromaVectorStore,
     VectorRecord,
@@ -156,29 +156,31 @@ class LLMFileProfileGenerator:
                 for item in generated
                 if isinstance(item, dict)
             }
-            missing = [
-                record["path"]
-                for record in batch
-                if record["path"] not in by_path
-            ]
-            if missing:
-                raise RuntimeError(
-                    "LLM file profile response omitted: "
-                    + ", ".join(missing)
-                )
             for record in batch:
-                item = by_path[record["path"]]
+                item = by_path.get(record["path"])
+                if not self._is_complete_item(item):
+                    retry_items = self._complete([record])
+                    item = next(
+                        (
+                            candidate
+                            for candidate in retry_items
+                            if isinstance(candidate, dict)
+                            and candidate.get("path") == record["path"]
+                        ),
+                        None,
+                    )
+                if not self._is_complete_item(item):
+                    raise RuntimeError(
+                        "LLM returned an incomplete profile for "
+                        + record["path"]
+                    )
+                assert item is not None
                 purpose = str(item.get("purpose", "")).strip()
                 responsibilities = _string_list(
                     item.get("responsibilities"),
                     limit=12,
                 )
                 evidence = _string_list(item.get("evidence"), limit=20)
-                if not purpose or not responsibilities:
-                    raise RuntimeError(
-                        "LLM returned an incomplete profile for "
-                        + record["path"]
-                    )
                 if not evidence:
                     evidence = [
                         f"{record['path']}#L{symbol['line']}"
@@ -211,6 +213,14 @@ class LLMFileProfileGenerator:
                     )
                 )
         return profiles
+
+    @staticmethod
+    def _is_complete_item(item: Any) -> bool:
+        return (
+            isinstance(item, dict)
+            and bool(str(item.get("purpose", "")).strip())
+            and bool(_string_list(item.get("responsibilities"), limit=12))
+        )
 
     def _ensure_model(self) -> None:
         if self.model is None:
@@ -713,9 +723,7 @@ class ProjectGraph:
         )
         self.config = config or ProjectGraphConfig.from_env()
         self.profile_generator = profile_generator or LLMFileProfileGenerator()
-        self.workspace_id = hashlib.sha256(
-            str(workspace.root).encode("utf-8")
-        ).hexdigest()[:24]
+        self.workspace_id = ProjectStorage(workspace).project_id
         self._store = store
         self.last_error = ""
 
