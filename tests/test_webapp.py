@@ -230,6 +230,21 @@ class WebAppTests(unittest.TestCase):
         self.assertTrue(index.json()["ready"])
         self.assertEqual(index.json()["indexed_files"], 1)
 
+        graph = self.client.get(
+            "/api/project-graph",
+            params={"workspace": str(self.workspace)},
+        )
+        self.assertEqual(graph.status_code, 200)
+        self.assertTrue(graph.json()["ready"])
+        self.assertEqual(graph.json()["profiles"], 1)
+
+        refreshed_graph = self.client.post(
+            "/api/project-graph/refresh",
+            params={"workspace": str(self.workspace)},
+        )
+        self.assertEqual(refreshed_graph.status_code, 200)
+        self.assertEqual(refreshed_graph.json()["updated_profiles"], 0)
+
     def test_rejects_invalid_mode_and_unknown_session(self):
         invalid_mode = self.client.post(
             "/api/requirements",

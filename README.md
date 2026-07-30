@@ -10,6 +10,7 @@
 - 搜索代码、符号及调用位置
 - 生成紧凑仓库地图
 - 持久化工作区项目树、代码片段、符号和依赖关系索引
+- 持久化文件功能档案与项目关系图，Neo4j 优先并自动降级到 SQLite
 - 每个新需求只重读发生变化的源码文件
 - 按行分段读取大型 UTF-8 文本文件
 - 创建新文件或精确替换已有文本
@@ -30,6 +31,7 @@
 ## 文档导航
 
 - [系统架构](docs/architecture.md)：模块职责、执行链路、工作流和持久化状态
+- [项目知识图谱](docs/project-graph.md)：文件职责、关系、增量维护和 Neo4j
 - [上下文与记忆](docs/context-and-memory.md)：上下文顺序、隔离、压缩和任务锚点
 - [LLM 与工具协议](docs/llm-protocol.md)：请求/响应 JSON、工具调用和收尾
 - [Web API](docs/web-api.md)：本地 HTTP 接口、Job 状态和调用示例
@@ -217,8 +219,42 @@ simple-agent --workspace /path/to/project --index-status
 同一工作区的所有会话共享一份项目索引。新需求会自动注入紧凑项目地图和少量相关
 代码片段，不会把完整项目树或全部代码加入模型上下文。
 
+## 项目知识图谱
+
+项目索引之上还会维护 `.simple-agent/graph/project-graph.db`，持久化每个文件的
+功能、职责、公开符号、依赖、关联测试和内容哈希，以及 `DEFINES`、
+`DEPENDS_ON`、`TESTS` 等关系。新需求先查询图谱和文件档案，再查询精确源码
+片段；只有准备修改或需要核实时才读取真实文件。未变化文件不会重复读取。
+
+默认优先使用 Neo4j，标准安装已包含官方驱动。若连接配置不完整、驱动初始化失败
+或服务暂时不可用，系统会自动使用 `.simple-agent/graph/project-graph.db` 中的
+SQLite 本地图谱；后续刷新会重试 Neo4j，恢复成功后自动切回。
+
+```dotenv
+PROJECT_GRAPH_BACKEND=neo4j
+NEO4J_URI=neo4j://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=change-me
+NEO4J_DATABASE=neo4j
+```
+
+SQLite 同时作为低延迟查询缓存和故障保底，因此 Neo4j 临时不可用不会阻断 Agent；
+活动后端、降级状态和原因会显示在图谱状态中。详细模型、一致性边界和安全说明见
+[项目知识图谱文档](docs/project-graph.md)。
+
+```bash
+simple-agent --workspace /path/to/project --refresh-graph
+simple-agent --workspace /path/to/project --graph-status
+```
+
 ## 工具
 
+- `project_graph_overview`：查看图谱规模、关系类型和代表性文件职责
+- `query_file_profiles`：按功能或概念检索文件档案
+- `file_profile`：读取单个文件的职责、依赖、测试和证据
+- `query_project_graph`：遍历文件、符号、模块和测试关系
+- `impact_analysis`：分析修改文件的潜在影响与验证范围
+- `graph_status` / `refresh_project_graph`：查看或增量刷新图谱
 - `project_overview`：读取缓存的项目树、模块、语言、入口和索引状态
 - `query_project_index`：从持久化 FTS5 索引检索相关代码片段
 - `search_symbols`：定位类、函数、接口等声明
@@ -310,6 +346,8 @@ Planner、Executor、Reflection Reviewer、修复任务和最终结果整理始�
 ├── index/
 │   ├── project-index.db
 │   └── repository-map.json
+├── graph/
+│   └── project-graph.db
 ├── knowledge/
 │   └── knowledge.db
 ├── memory/

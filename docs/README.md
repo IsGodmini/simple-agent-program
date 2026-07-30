@@ -3,6 +3,7 @@
 README 负责快速开始和功能概览；这里记录实现原理、接口、安全边界和二次开发方法。
 
 - [系统架构](architecture.md)：模块职责、执行链路、工作流和持久化状态
+- [项目知识图谱](project-graph.md)：文件功能档案、关系模型和 Neo4j 配置
 - [上下文与记忆](context-and-memory.md)：上下文顺序、隔离、压缩和任务锚点
 - [LLM 与工具协议](llm-protocol.md)：真实请求/响应结构和工具循环
 - [Web API](web-api.md)：本地 HTTP 接口、请求示例和 Job 状态

@@ -12,6 +12,7 @@ from .agent import AgentResult, ToolExecution
 from .knowledge import KnowledgeBase
 from .llm import Message
 from .memory import BuiltContext, ContextBuilder, ProjectMemoryStore, TaskSummary
+from .project_graph import ProjectGraph
 from .project_index import ProjectIndex
 
 
@@ -26,6 +27,7 @@ class RequirementRun:
     context_messages: List[Message]
     memory_summary_ids: List[str]
     knowledge_citations: List[str] = field(default_factory=list)
+    project_graph_citations: List[str] = field(default_factory=list)
     project_index_citations: List[str] = field(default_factory=list)
 
 
@@ -38,6 +40,7 @@ class SessionManager:
         context_builder: Optional[ContextBuilder] = None,
         knowledge_base: Optional[KnowledgeBase] = None,
         project_index: Optional[ProjectIndex] = None,
+        project_graph: Optional[ProjectGraph] = None,
         session_id: str = "default",
     ) -> None:
         self.store = store
@@ -45,10 +48,15 @@ class SessionManager:
         self.store.ensure_session(session_id)
         self.knowledge_base = knowledge_base or KnowledgeBase(store.workspace)
         self.project_index = project_index or ProjectIndex(store.workspace)
+        self.project_graph = project_graph or ProjectGraph(
+            store.workspace,
+            self.project_index,
+        )
         self.context_builder = context_builder or ContextBuilder(
             store,
             knowledge_base=self.knowledge_base,
             project_index=self.project_index,
+            project_graph=self.project_graph,
         )
 
     def start_requirement(self, request: str) -> RequirementRun:
@@ -69,6 +77,7 @@ class SessionManager:
             context_messages=built.messages,
             memory_summary_ids=built.summary_ids,
             knowledge_citations=built.knowledge_citations,
+            project_graph_citations=built.project_graph_citations,
             project_index_citations=built.project_index_citations,
         )
 
@@ -109,6 +118,7 @@ class SessionManager:
                 "finished_at": finished_at,
                 "memory_summary_ids": session.memory_summary_ids,
                 "knowledge_citations": session.knowledge_citations,
+                "project_graph_citations": session.project_graph_citations,
                 "project_index_citations": (
                     session.project_index_citations
                 ),
@@ -161,6 +171,7 @@ class SessionManager:
                 "finished_at": finished_at,
                 "memory_summary_ids": session.memory_summary_ids,
                 "knowledge_citations": session.knowledge_citations,
+                "project_graph_citations": session.project_graph_citations,
                 "project_index_citations": (
                     session.project_index_citations
                 ),

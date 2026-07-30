@@ -28,6 +28,38 @@ class MemoryLifecycleTests(unittest.TestCase):
                 built.messages[0]["content"],
             )
 
+    def test_session_injects_relevant_graph_profiles_before_source_chunks(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "auth.py").write_text(
+                '"""Authenticate users with login tokens."""\n'
+                "def login():\n"
+                "    return True\n",
+                encoding="utf-8",
+            )
+            manager = SessionManager(
+                ProjectMemoryStore(Workspace(root))
+            )
+
+            requirement = manager.start_task("change login authentication")
+            contents = [
+                message["content"]
+                for message in requirement.context_messages
+            ]
+
+            graph_position = next(
+                index
+                for index, content in enumerate(contents)
+                if "<project_graph_json>" in content
+            )
+            index_position = next(
+                index
+                for index, content in enumerate(contents)
+                if "<project_index_json>" in content
+            )
+            self.assertLess(graph_position, index_position)
+            self.assertIn("graph:auth.py", requirement.project_graph_citations)
+
     def test_new_task_gets_summary_but_not_old_raw_tool_transcript(self):
         with TemporaryDirectory() as directory:
             workspace = Workspace(Path(directory))

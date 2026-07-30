@@ -10,6 +10,15 @@ from .files import (
     RepositoryMapTool,
     SearchCodeTool,
 )
+from .graph import (
+    FileProfileTool,
+    GraphStatusTool,
+    ImpactAnalysisTool,
+    ProjectGraphOverviewTool,
+    QueryFileProfilesTool,
+    QueryProjectGraphTool,
+    RefreshProjectGraphTool,
+)
 from .knowledge import ListKnowledgeTool, ReadKnowledgeTool, SearchKnowledgeTool
 from .memory import ReadEpisodeTool, SearchMemoryTool
 from .project import (
@@ -27,6 +36,9 @@ __all__ = [
     "DependencyGraphTool",
     "FindFilesTool",
     "FindReferencesTool",
+    "FileProfileTool",
+    "GraphStatusTool",
+    "ImpactAnalysisTool",
     "IndexStatusTool",
     "ListFilesTool",
     "ListKnowledgeTool",
@@ -35,8 +47,12 @@ __all__ = [
     "ReadKnowledgeTool",
     "ReadOnlyCommandTool",
     "ProjectOverviewTool",
+    "ProjectGraphOverviewTool",
+    "QueryFileProfilesTool",
+    "QueryProjectGraphTool",
     "QueryProjectIndexTool",
     "RefreshProjectIndexTool",
+    "RefreshProjectGraphTool",
     "RepositoryMapTool",
     "RunCommandTool",
     "SearchCodeTool",

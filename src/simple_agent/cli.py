@@ -11,6 +11,7 @@ from .context import ContextBudget, ContextManager
 from .knowledge import KnowledgeBase, document_to_dict, is_supported_document
 from .llm import OpenAICompatibleLLM
 from .memory import ProjectMemoryStore
+from .project_graph import ProjectGraph
 from .project_index import ProjectIndex
 from .session import SessionManager, write_trace
 from .tools import (
@@ -18,6 +19,9 @@ from .tools import (
     DependencyGraphTool,
     FindFilesTool,
     FindReferencesTool,
+    FileProfileTool,
+    GraphStatusTool,
+    ImpactAnalysisTool,
     IndexStatusTool,
     ListFilesTool,
     ListKnowledgeTool,
@@ -26,8 +30,12 @@ from .tools import (
     ReadKnowledgeTool,
     ReadOnlyCommandTool,
     ProjectOverviewTool,
+    ProjectGraphOverviewTool,
+    QueryFileProfilesTool,
+    QueryProjectGraphTool,
     QueryProjectIndexTool,
     RefreshProjectIndexTool,
+    RefreshProjectGraphTool,
     RepositoryMapTool,
     RunCommandTool,
     SearchCodeTool,
@@ -47,13 +55,24 @@ def build_agent(
     agent_mode: Optional[str] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     project_index: Optional[ProjectIndex] = None,
+    project_graph: Optional[ProjectGraph] = None,
 ) -> WorkflowOrchestrator:
     settings = Settings.from_env()
     workspace = Workspace(workspace_path)
     memory_store = memory_store or ProjectMemoryStore(workspace)
     knowledge_base = knowledge_base or KnowledgeBase(workspace)
     project_index = project_index or ProjectIndex(workspace)
+    project_graph = project_graph or ProjectGraph(workspace, project_index)
+    graph_query_tools = [
+        ProjectGraphOverviewTool(project_graph),
+        QueryFileProfilesTool(project_graph),
+        FileProfileTool(project_graph),
+        QueryProjectGraphTool(project_graph),
+        ImpactAnalysisTool(project_graph),
+        GraphStatusTool(project_graph),
+    ]
     project_query_tools = [
+        *graph_query_tools,
         ProjectOverviewTool(project_index),
         QueryProjectIndexTool(project_index),
         SearchSymbolsTool(project_index),
@@ -64,6 +83,7 @@ def build_agent(
     executor_tools = ToolRegistry(
         [
             *project_query_tools,
+            RefreshProjectGraphTool(project_graph),
             RefreshProjectIndexTool(project_index),
             ListFilesTool(workspace),
             FindFilesTool(workspace),
@@ -72,7 +92,7 @@ def build_agent(
             ReadFileTool(workspace),
             ApplyPatchTool(
                 workspace,
-                on_change=lambda path: project_index.refresh([path]),
+                on_change=lambda path: project_graph.refresh([path]),
             ),
             RunCommandTool(workspace),
             SearchKnowledgeTool(knowledge_base),
@@ -219,6 +239,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show persistent project index status without calling the LLM.",
     )
+    parser.add_argument(
+        "--refresh-graph",
+        action="store_true",
+        help="Refresh project relationships and persistent file profiles.",
+    )
+    parser.add_argument(
+        "--graph-status",
+        action="store_true",
+        help="Show project graph and Neo4j mirror status without calling the LLM.",
+    )
     return parser.parse_args()
 
 
@@ -228,6 +258,7 @@ def main() -> None:
     memory_store = ProjectMemoryStore(workspace)
     knowledge_base = KnowledgeBase(workspace)
     project_index = ProjectIndex(workspace)
+    project_graph = ProjectGraph(workspace, project_index)
     session_id, session_output = _handle_session_actions(args, memory_store)
     if session_output:
         print(session_output)
@@ -237,6 +268,9 @@ def main() -> None:
     index_output = _handle_index_actions(args, project_index)
     if index_output:
         print(index_output)
+    graph_output = _handle_graph_actions(args, project_graph)
+    if graph_output:
+        print(graph_output)
 
     request = " ".join(args.request).strip()
     if not request:
@@ -249,6 +283,8 @@ def main() -> None:
             or args.list_sessions
             or args.refresh_index
             or args.index_status
+            or args.refresh_graph
+            or args.graph_status
         ):
             return
         raise ValueError(
@@ -259,6 +295,7 @@ def main() -> None:
         memory_store,
         knowledge_base=knowledge_base,
         project_index=project_index,
+        project_graph=project_graph,
         session_id=session_id,
     )
     task = session_manager.start_task(request)
@@ -268,6 +305,7 @@ def main() -> None:
             memory_store=memory_store,
             knowledge_base=knowledge_base,
             project_index=project_index,
+            project_graph=project_graph,
             agent_mode=args.agent_mode,
         ).run(
             request,
@@ -307,6 +345,32 @@ def _handle_index_actions(
             "项目索引状态：\n"
             + json.dumps(
                 project_index.status(),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    return "\n".join(output)
+
+
+def _handle_graph_actions(
+    args: argparse.Namespace,
+    project_graph: ProjectGraph,
+) -> str:
+    output = []
+    if args.refresh_graph:
+        output.append(
+            "项目图谱已增量刷新：\n"
+            + json.dumps(
+                asdict(project_graph.refresh()),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    if args.graph_status:
+        output.append(
+            "项目图谱状态：\n"
+            + json.dumps(
+                project_graph.status(),
                 ensure_ascii=False,
                 indent=2,
             )

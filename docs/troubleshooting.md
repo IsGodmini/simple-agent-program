@@ -119,6 +119,25 @@ simple-agent --workspace /path/to/project --index-status
 
 删除索引不会删除源码、会话、知识库或 Episode。
 
+## 项目图谱或 Neo4j 没有更新
+
+```bash
+simple-agent --workspace /path/to/project --refresh-graph
+simple-agent --workspace /path/to/project --graph-status
+```
+
+SQLite 保底图谱位于 `.simple-agent/graph/project-graph.db`。Neo4j 是默认请求
+后端，若状态显示已经降级：
+
+1. 确认已执行 `pip install -e .`；
+2. 检查 `NEO4J_URI`、用户名、密码和数据库名；
+3. 查看状态中的 `neo4j_last_error`；
+4. 修复连接后再次刷新，成功时间会写入 `neo4j_last_sync`。
+
+Neo4j 不可用不会使本地代码修改回滚。状态中的 `backend=sqlite`、
+`fallback_active=true` 和 `fallback_reason` 会说明降级原因。停止 Agent 后可删除
+`graph/` 重建本地图谱；Neo4j 中旧工作区快照会在下一次成功同步时替换。
+
 ## 知识文档无法导入
 
 - 单文件不能超过 50 MiB。
@@ -163,6 +182,7 @@ GET /api/jobs/<job-id>
 操作前先备份 `.simple-agent/`。不同子目录可以独立重建：
 
 - `index/`：可删除并自动重建；
+- `graph/`：可删除并从项目索引自动重建；
 - `knowledge/`：删除会丢失已导入知识，需要重新导入；
 - `memory/` 和 `episodes/`：删除会永久丢失会话和历史。
 

@@ -26,6 +26,7 @@ from .knowledge import (
     document_to_dict,
 )
 from .memory import ProjectMemoryStore
+from .project_graph import ProjectGraph
 from .project_index import ProjectIndex
 from .session import SessionManager
 from .workspace import Workspace
@@ -139,10 +140,12 @@ class JobManager:
                 store = ProjectMemoryStore(workspace)
                 knowledge = KnowledgeBase(workspace)
                 project_index = ProjectIndex(workspace)
+                project_graph = ProjectGraph(workspace, project_index)
                 session_manager = SessionManager(
                     store,
                     knowledge_base=knowledge,
                     project_index=project_index,
+                    project_graph=project_graph,
                     session_id=snapshot["session_id"],
                 )
                 requirement = session_manager.start_requirement(
@@ -159,10 +162,15 @@ class JobManager:
                         "project_index_count": len(
                             requirement.project_index_citations
                         ),
+                        "project_graph_count": len(
+                            requirement.project_graph_citations
+                        ),
                         "message": (
                             "上下文构建完成："
                             f"{len(requirement.memory_summary_ids)} 条记忆，"
                             f"{len(requirement.knowledge_citations)} 条知识引用，"
+                            f"{len(requirement.project_graph_citations)} "
+                            "个相关文件档案，"
                             f"{len(requirement.project_index_citations)} "
                             "个相关代码片段"
                         ),
@@ -174,6 +182,7 @@ class JobManager:
                         memory_store=store,
                         knowledge_base=knowledge,
                         project_index=project_index,
+                        project_graph=project_graph,
                         agent_mode=snapshot["agent_mode"],
                         progress_callback=lambda event: self._record_progress(
                             job_id,
@@ -305,6 +314,7 @@ def create_app(
                 store.ensure_session("default")
             knowledge = KnowledgeBase(workspace)
             project_index = ProjectIndex(workspace)
+            project_graph = ProjectGraph(workspace, project_index)
             return {
                 "path": str(workspace.root),
                 "sessions": [
@@ -315,6 +325,7 @@ def create_app(
                     for document in knowledge.list_documents()
                 ],
                 "project_index": project_index.status(),
+                "project_graph": project_graph.status(),
             }
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -434,6 +445,28 @@ def create_app(
     ) -> Dict[str, Any]:
         try:
             return asdict(ProjectIndex(_workspace(workspace)).refresh())
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/project-graph")
+    def project_graph_status(
+        workspace: str = Query(..., min_length=1),
+    ) -> Dict[str, Any]:
+        try:
+            root = _workspace(workspace)
+            index = ProjectIndex(root)
+            return ProjectGraph(root, index).overview()
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/project-graph/refresh")
+    def refresh_project_graph(
+        workspace: str = Query(..., min_length=1),
+    ) -> Dict[str, Any]:
+        try:
+            root = _workspace(workspace)
+            index = ProjectIndex(root)
+            return asdict(ProjectGraph(root, index).refresh())
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

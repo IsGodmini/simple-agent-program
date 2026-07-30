@@ -7,6 +7,7 @@ const state = {
   requirements: [],
   knowledge: [],
   projectIndex: null,
+  projectGraph: null,
   currentJob: null,
   polling: false,
 };
@@ -82,8 +83,14 @@ function updateMemoryStatus() {
   const indexed = state.projectIndex && state.projectIndex.ready
     ? `${state.projectIndex.indexed_files} 索引文件`
     : "索引待初始化";
+  const graphed = state.projectGraph && state.projectGraph.ready
+    ? `${state.projectGraph.profiles} 文件档案 / ${state.projectGraph.edges} 关系 / `
+      + `${state.projectGraph.backend === "neo4j" ? "Neo4j" : "SQLite"}`
+      + `${state.projectGraph.fallback_active ? "（降级）" : ""}`
+    : "图谱待初始化";
   elements.memoryStatus.textContent = (
-    `${state.sessions.length} 会话 · ${state.knowledge.length} 资料 · ${indexed}`
+    `${state.sessions.length} 会话 · ${state.knowledge.length} 资料 · `
+    + `${indexed} · ${graphed}`
   );
 }
 
@@ -438,6 +445,7 @@ async function connectWorkspace(path) {
     state.sessions = overview.sessions;
     state.knowledge = overview.knowledge;
     state.projectIndex = overview.project_index;
+    state.projectGraph = overview.project_graph;
     state.currentJob = null;
     localStorage.setItem("simple-agent-workspace", state.workspace);
     elements.workspacePath.value = state.workspace;
@@ -592,6 +600,9 @@ async function pollJob(jobId) {
         state.sessions = await api(`/api/sessions?${queryWorkspace()}`);
         state.projectIndex = await api(
           `/api/project-index?${queryWorkspace()}`,
+        );
+        state.projectGraph = await api(
+          `/api/project-graph?${queryWorkspace()}`,
         );
         renderSessions();
         await selectSession(state.currentSession);

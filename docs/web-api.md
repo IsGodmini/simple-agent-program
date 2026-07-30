@@ -43,6 +43,8 @@ http://127.0.0.1:8765/api/docs
 | DELETE | `/api/knowledge/{id}` | 删除知识文档 |
 | GET | `/api/project-index` | 查看项目索引概览 |
 | POST | `/api/project-index/refresh` | 增量刷新项目索引 |
+| GET | `/api/project-graph` | 查看图谱、文件档案和 Neo4j 状态 |
+| POST | `/api/project-graph/refresh` | 增量刷新索引、档案、关系和活动后端 |
 
 ## 初始化
 
@@ -198,3 +200,17 @@ curl -X POST \
 ```
 
 通常不需要手动刷新：新需求开始和 `apply_patch` 修改后都会自动更新索引。
+
+## 项目图谱
+
+```http
+GET /api/project-graph?workspace=/path/to/project
+```
+
+```bash
+curl -X POST \
+  'http://127.0.0.1:8765/api/project-graph/refresh?workspace=/path/to/project'
+```
+
+图谱响应包含文件档案、节点、边、关系类型，以及 Neo4j/SQLite 活动后端、
+自动降级原因和最近同步状态。

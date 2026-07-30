@@ -37,6 +37,7 @@ src/simple_agent/
 ├── session.py            需求生命周期
 ├── knowledge.py          文档解析和 RAG
 ├── project_index.py      增量源码索引
+├── project_graph.py      Neo4j 优先关系图、文件档案和 SQLite 保底
 ├── llm.py                Chat Completions 适配器
 ├── cli.py                CLI 入口和依赖装配
 ├── webapp.py             FastAPI 与后台 Job
@@ -110,6 +111,16 @@ class ExampleTool(Tool):
 - 删除文件清理关联记录；
 - 敏感路径和符号链接拒绝；
 - 中文和标识符检索。
+
+## 修改项目图谱
+
+图谱本地表包括 `file_profiles`、`profile_fts`、`graph_nodes` 和 `graph_edges`。
+文件档案必须绑定内容哈希；修改档案算法时提升 `PROFILE_VERSION`，修改图结构时
+提升 `GRAPH_VERSION`。Neo4j 是默认请求后端，SQLite 是始终维护的查询缓存和故障
+保底；查询功能不能依赖网络可用性，也不能向模型暴露任意 Cypher。
+
+测试至少覆盖：未变化源码不重读、修改和删除同步、关系与影响分析、符号链接拒绝、
+参数化 Neo4j 查询，以及 Neo4j 凭据不出现在查询文本或结果中。
 
 ## 修改工作流
 
