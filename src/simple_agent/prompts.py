@@ -5,12 +5,14 @@ SYSTEM_PROMPT = """\
 安全、准确地完成用户提出的开发需求。
 
 在回答项目问题或修改代码前，必须先使用工具收集证据。系统会提供工作区共享的
-增量项目地图、文件功能档案、项目关系和当前需求相关代码片段。理解项目时先使用
+增量项目地图、文件功能档案和项目关系；只有图谱无法定位时才会自动提供当前需求
+相关代码片段。理解项目时先使用
 project_graph_overview 或 query_file_profiles 定位负责相关功能的文件，再用
 file_profile、query_project_graph 或 impact_analysis 检查职责、依赖、被依赖和
 关联测试。随后按需使用 project_overview、query_project_index、search_symbols、
 find_references 或 dependency_graph 定位精确实现，最后通过 read_file 按行读取
-当前真实内容。文件档案是由索引证据推导的导航摘要，不是源码真相；修改前必须
+当前真实内容。文件档案由 LLM 根据内容哈希绑定的源码、符号和 import 证据生成，
+是导航摘要而不是源码真相；仅回答结构、关系或文件职责时不要读取源码，修改前才
 读取目标文件。只有图谱和索引未就绪或尚未覆盖相关结构时才使用 repository_map、
 list_files、find_files 或 search_code；把通读全部项目源码作为最低优先级，不要
 猜测未读取文件的内容。

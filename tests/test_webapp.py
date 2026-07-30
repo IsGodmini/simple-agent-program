@@ -235,8 +235,8 @@ class WebAppTests(unittest.TestCase):
             params={"workspace": str(self.workspace)},
         )
         self.assertEqual(graph.status_code, 200)
-        self.assertTrue(graph.json()["ready"])
-        self.assertEqual(graph.json()["profiles"], 1)
+        self.assertFalse(graph.json()["ready"])
+        self.assertEqual(graph.json()["storage"], "neo4j-only")
 
         refreshed_graph = self.client.post(
             "/api/project-graph/refresh",
@@ -244,6 +244,7 @@ class WebAppTests(unittest.TestCase):
         )
         self.assertEqual(refreshed_graph.status_code, 200)
         self.assertEqual(refreshed_graph.json()["updated_profiles"], 0)
+        self.assertIn("Neo4j graph requires", refreshed_graph.json()["error"])
 
     def test_rejects_invalid_mode_and_unknown_session(self):
         invalid_mode = self.client.post(

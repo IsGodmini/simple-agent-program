@@ -37,7 +37,8 @@ src/simple_agent/
 ├── session.py            需求生命周期
 ├── knowledge.py          文档解析和 RAG
 ├── project_index.py      增量源码索引
-├── project_graph.py      Neo4j 优先关系图、文件档案和 SQLite 保底
+├── project_graph.py      Neo4j 唯一关系图和 LLM 文件档案
+├── vector_store.py       Chroma、Embedding 与混合排序
 ├── llm.py                Chat Completions 适配器
 ├── cli.py                CLI 入口和依赖装配
 ├── webapp.py             FastAPI 与后台 Job
@@ -114,13 +115,19 @@ class ExampleTool(Tool):
 
 ## 修改项目图谱
 
-图谱本地表包括 `file_profiles`、`profile_fts`、`graph_nodes` 和 `graph_edges`。
-文件档案必须绑定内容哈希；修改档案算法时提升 `PROFILE_VERSION`，修改图结构时
-提升 `GRAPH_VERSION`。Neo4j 是默认请求后端，SQLite 是始终维护的查询缓存和故障
-保底；查询功能不能依赖网络可用性，也不能向模型暴露任意 Cypher。
+文件档案必须绑定内容哈希；修改 LLM 输出结构时提升 `PROFILE_VERSION`，修改图
+结构时提升 `GRAPH_VERSION`。Neo4j 是唯一图存储，不得重新引入 SQLite 图节点或
+关系表，也不能向模型暴露任意 Cypher。快照替换必须处于一个 Neo4j 事务内。
 
-测试至少覆盖：未变化源码不重读、修改和删除同步、关系与影响分析、符号链接拒绝、
-参数化 Neo4j 查询，以及 Neo4j 凭据不出现在查询文本或结果中。
+测试至少覆盖：LLM JSON 校验、未变化内容不重复生成档案、修改和删除同步、真实
+关系类型、事务回滚以及 Neo4j 凭据不出现在查询文本或结果中。编辑回调只能更新
+确定性索引并标记档案过期；LLM 档案更新必须在需求结束时按变化文件去重后批量执行。
+
+## 修改向量检索
+
+Chroma 集合只能保存向量、原文和标量元数据，不能承担图关系或业务状态。向量 ID
+必须稳定，内容哈希或 Embedding 模型变化时才重新编码。混合检索需要分别计算
+关键词和向量排名，再通过 RRF 合并，不能直接比较 BM25 分数与向量距离。
 
 ## 修改工作流
 

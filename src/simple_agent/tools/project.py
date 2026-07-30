@@ -84,7 +84,7 @@ class QueryProjectIndexTool(Tool):
             raise ValueError("query must be a non-empty string")
         if not isinstance(limit, int) or not 1 <= limit <= 20:
             raise ValueError("limit must be from 1 to 20")
-        hits = self.project_index.search(query, limit)
+        hits = self.project_index.search_hybrid(query, limit)
         if not hits:
             return "持久化项目索引中没有找到相关代码。"
         return json.dumps(

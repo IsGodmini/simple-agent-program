@@ -192,7 +192,7 @@ class ImpactAnalysisTool(Tool):
 class GraphStatusTool(Tool):
     name = "graph_status"
     description = (
-        "查看项目图谱、文件功能档案、Neo4j 活动状态以及 SQLite 自动降级原因。"
+        "查看 Neo4j 项目关系图、LLM 文件功能档案和 Chroma 向量检索状态。"
     )
     parameters = {
         "type": "object",

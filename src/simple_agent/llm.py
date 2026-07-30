@@ -24,12 +24,25 @@ class ChatModel(Protocol):
 class OpenAICompatibleLLM:
     """Chat Completions client for OpenAI-compatible providers."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+    ) -> None:
         self.model = settings.model
         self.max_output_tokens = settings.max_output_tokens
+        client_options: Dict[str, Any] = {
+            "api_key": settings.api_key,
+            "base_url": settings.base_url,
+        }
+        if timeout is not None:
+            client_options["timeout"] = timeout
+        if max_retries is not None:
+            client_options["max_retries"] = max_retries
         self.client = OpenAI(
-            api_key=settings.api_key,
-            base_url=settings.base_url,
+            **client_options,
         )
 
     def complete(

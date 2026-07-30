@@ -2,9 +2,12 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from simple_agent.agent import AgentResult, ToolExecution
 from simple_agent.memory import ContextBuilder, ProjectMemoryStore, TaskSummary
+from simple_agent.project_graph import FileProfile, GraphRefreshResult
+from simple_agent.project_index import ProjectIndex
 from simple_agent.session import SessionManager
 from simple_agent.tools import ListFilesTool, ReadEpisodeTool, ReadFileTool
 from simple_agent.workspace import Workspace
@@ -28,7 +31,7 @@ class MemoryLifecycleTests(unittest.TestCase):
                 built.messages[0]["content"],
             )
 
-    def test_session_injects_relevant_graph_profiles_before_source_chunks(self):
+    def test_session_places_neo4j_context_before_source_chunks(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "auth.py").write_text(
@@ -58,7 +61,11 @@ class MemoryLifecycleTests(unittest.TestCase):
                 if "<project_index_json>" in content
             )
             self.assertLess(graph_position, index_position)
-            self.assertIn("graph:auth.py", requirement.project_graph_citations)
+            self.assertEqual(requirement.project_graph_citations, [])
+            self.assertIn(
+                "Neo4j graph requires",
+                contents[graph_position],
+            )
 
     def test_new_task_gets_summary_but_not_old_raw_tool_transcript(self):
         with TemporaryDirectory() as directory:
@@ -133,6 +140,70 @@ class MemoryLifecycleTests(unittest.TestCase):
             )
             self.assertIn(first.task_id, second.memory_summary_ids)
 
+    def test_task_completion_batches_changed_file_graph_refresh(self):
+        class RecordingGraph:
+            def __init__(self):
+                self.calls = []
+
+            def refresh(self, paths=None):
+                self.calls.append(list(paths or []))
+                return GraphRefreshResult(
+                    scanned_files=len(paths or []),
+                    updated_profiles=len(paths or []),
+                    unchanged_profiles=0,
+                    deleted_profiles=0,
+                    nodes=0,
+                    edges=0,
+                    duration_ms=0,
+                    backend="neo4j",
+                    neo4j_synced=True,
+                    refreshed_at="now",
+                )
+
+        with TemporaryDirectory() as directory:
+            store = ProjectMemoryStore(Workspace(Path(directory)))
+            graph = RecordingGraph()
+            manager = SessionManager(
+                store,
+                context_builder=ContextBuilder(store),
+                project_graph=graph,
+            )
+            task = manager.start_task("修改认证和服务模块")
+            result = AgentResult(
+                content="完成",
+                iterations=1,
+                messages=[],
+                tool_executions=[
+                    ToolExecution(
+                        tool_call_id="one",
+                        name="apply_patch",
+                        arguments='{"path":"auth.py"}',
+                        result="Updated auth.py",
+                    ),
+                    ToolExecution(
+                        tool_call_id="two",
+                        name="apply_patch",
+                        arguments='{"path":"service.py"}',
+                        result="Updated service.py",
+                    ),
+                    ToolExecution(
+                        tool_call_id="three",
+                        name="apply_patch",
+                        arguments='{"path":"auth.py"}',
+                        result="Updated auth.py",
+                    ),
+                ],
+            )
+
+            manager.complete_task(task, result)
+
+            self.assertEqual(graph.calls, [["auth.py", "service.py"]])
+            episode = store.read_episode(task.task_id)
+            self.assertEqual(
+                episode["project_graph_refresh"]["updated_profiles"],
+                2,
+            )
+
     def test_failed_task_is_persisted(self):
         with TemporaryDirectory() as directory:
             store = ProjectMemoryStore(Workspace(Path(directory)))
@@ -171,6 +242,65 @@ class MemoryRetrievalTests(unittest.TestCase):
             matches = store.search_summaries("登录认证失败", limit=1)
 
             self.assertEqual(matches[0].task_id, "task-auth")
+
+    def test_graph_matches_suppress_automatic_source_chunk_injection(self):
+        class GraphWithMatch:
+            def refresh(self):
+                return None
+
+            def search_profiles(self, query, limit):
+                return [
+                    FileProfile(
+                        path="auth.py",
+                        content_hash="hash",
+                        language="Python",
+                        line_count=2,
+                        purpose="处理用户认证。",
+                        responsibilities=["验证登录令牌"],
+                        public_symbols=[],
+                        imports=[],
+                        related_tests=[],
+                        confidence=0.9,
+                        evidence=["auth.py#L1"],
+                        stale=False,
+                        profile_version=2,
+                        updated_at="now",
+                    )
+                ]
+
+            def neighbors(self, path, depth, limit):
+                return {"nodes": [], "edges": []}
+
+            def overview(self, max_profiles):
+                return {"ready": True, "backend": "neo4j"}
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "auth.py").write_text(
+                "def login(token):\n    return bool(token)\n",
+                encoding="utf-8",
+            )
+            workspace = Workspace(root)
+            store = ProjectMemoryStore(workspace)
+            index = ProjectIndex(workspace)
+            index.refresh()
+            with patch.object(
+                index,
+                "search_hybrid",
+                wraps=index.search_hybrid,
+            ) as source_search:
+                built = ContextBuilder(
+                    store,
+                    project_index=index,
+                    project_graph=GraphWithMatch(),
+                ).build("认证模块负责什么")
+
+            source_search.assert_not_called()
+            self.assertEqual(built.project_index_citations, [])
+            self.assertEqual(
+                built.project_graph_citations,
+                ["graph:auth.py"],
+            )
 
     def test_read_episode_tool_requires_valid_id(self):
         with TemporaryDirectory() as directory:

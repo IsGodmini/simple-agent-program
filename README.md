@@ -10,7 +10,8 @@
 - 搜索代码、符号及调用位置
 - 生成紧凑仓库地图
 - 持久化工作区项目树、代码片段、符号和依赖关系索引
-- 持久化文件功能档案与项目关系图，Neo4j 优先并自动降级到 SQLite
+- 使用 Neo4j 持久化真实项目关系图和 LLM 生成的文件功能档案
+- 使用 Chroma 保存向量，并融合 FTS5/BM25 与语义向量检索
 - 每个新需求只重读发生变化的源码文件
 - 按行分段读取大型 UTF-8 文本文件
 - 创建新文件或精确替换已有文本
@@ -187,8 +188,9 @@ simple-agent --workspace /path/to/project \
 需要先转换为可搜索 PDF。单文件默认上限为 50 MiB，最多提取 200 万字符。
 
 文档会被解析、分块并写入项目的
-`.simple-agent/knowledge/knowledge.db`。检索使用 SQLite FTS5 和中英文词项，
-不依赖外部 Embedding 服务。每次新需求只自动注入少量相关片段，并保留
+`.simple-agent/knowledge/knowledge.db`。关键词检索使用 SQLite FTS5/BM25；
+配置 Embedding 后，片段向量同时写入 `.simple-agent/vector/` 中的 Chroma，
+检索结果通过 RRF 融合。每次新需求只自动注入少量相关片段，并保留
 `knowledge:<document-id>#chunk-<n>` 引用；完整知识库不会被塞入上下文。
 
 ## 增量项目索引
@@ -206,8 +208,9 @@ simple-agent --workspace /path/to/project \
 `.env`、私钥、Git 内部数据、虚拟环境、依赖目录和构建产物不会进入索引。
 
 后续需求仍会检查文件路径、大小和修改时间，但不会重新读取内容没有变化的源码。
-新增、修改和删除的文件会增量更新；Agent 使用 `apply_patch` 修改代码后，会立即
-刷新对应文件。索引用于定位范围，修改前仍会使用 `read_file` 核对当前真实内容。
+新增、修改和删除的文件会增量更新；Agent 使用 `apply_patch` 修改代码后，只立即
+更新对应文件的确定性索引并标记图谱档案过期，不调用档案 LLM。索引用于定位范围，
+修改前仍会使用 `read_file` 核对当前真实内容。
 
 可以不调用 LLM，手动刷新或查看状态：
 
@@ -216,31 +219,51 @@ simple-agent --workspace /path/to/project --refresh-index
 simple-agent --workspace /path/to/project --index-status
 ```
 
-同一工作区的所有会话共享一份项目索引。新需求会自动注入紧凑项目地图和少量相关
-代码片段，不会把完整项目树或全部代码加入模型上下文。
+同一工作区的所有会话共享一份项目索引。新需求优先注入 Neo4j 文件档案和关系；
+只有图谱没有匹配结果或不可用时才自动检索少量相关代码片段。系统不会把完整项目树
+或全部代码加入模型上下文。
 
 ## 项目知识图谱
 
-项目索引之上还会维护 `.simple-agent/graph/project-graph.db`，持久化每个文件的
-功能、职责、公开符号、依赖、关联测试和内容哈希，以及 `DEFINES`、
-`DEPENDS_ON`、`TESTS` 等关系。新需求先查询图谱和文件档案，再查询精确源码
-片段；只有准备修改或需要核实时才读取真实文件。未变化文件不会重复读取。
-
-默认优先使用 Neo4j，标准安装已包含官方驱动。若连接配置不完整、驱动初始化失败
-或服务暂时不可用，系统会自动使用 `.simple-agent/graph/project-graph.db` 中的
-SQLite 本地图谱；后续刷新会重试 Neo4j，恢复成功后自动切回。
+项目索引之上使用 Neo4j 持久化每个文件的功能、职责、公开符号、依赖、关联测试
+和内容哈希，以及真实的 `CONTAINS`、`DEFINES`、`IMPORTS`、`DEPENDS_ON`、
+`TESTS` 关系。文件功能由 LLM 根据代码片段、符号和导入证据批量生成；内容哈希
+未变化时不会重复调用 LLM。一次需求中的多次文件修改只标记档案过期，需求结束后
+按去重文件列表批量生成档案，避免每次补丁触发 LLM。项目不再维护 SQLite 图数据库
+或图谱保底副本。
 
 ```dotenv
-PROJECT_GRAPH_BACKEND=neo4j
 NEO4J_URI=neo4j://localhost:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=change-me
 NEO4J_DATABASE=neo4j
 ```
 
-SQLite 同时作为低延迟查询缓存和故障保底，因此 Neo4j 临时不可用不会阻断 Agent；
-活动后端、降级状态和原因会显示在图谱状态中。详细模型、一致性边界和安全说明见
+Neo4j 未配置或不可用时，源码关键词索引仍可使用，但图谱和文件功能档案不可用，
+状态会明确返回错误，不会切换到另一套图数据库。详细说明见
 [项目知识图谱文档](docs/project-graph.md)。
+
+## 本地 Embedding 与 Chroma 混合检索
+
+Chroma 与 Neo4j 完全解耦，用于代码块、知识片段、文件功能档案和场景记忆摘要的
+向量检索。Embedding 仅允许通过回环地址连接本机 Ollama，源码不会发送给远程
+Embedding 服务。先安装 Ollama 并下载模型：
+
+```bash
+ollama pull qwen3-embedding:0.6b
+```
+
+然后配置：
+
+```dotenv
+EMBEDDING_MODEL=qwen3-embedding:0.6b
+EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1
+```
+
+每条向量绑定内容哈希和 Embedding 模型版本，只重新编码变化内容。检索同时执行
+FTS5/BM25 与 Chroma 近邻查询，再使用 Reciprocal Rank Fusion 合并独立排名。
+Embedding 未配置、Ollama 未启动或暂时失败时保留关键词检索，并在状态中记录
+向量错误。非 `localhost`、`127.0.0.1` 或 `::1` 地址会被代码拒绝。
 
 ```bash
 simple-agent --workspace /path/to/project --refresh-graph
@@ -256,7 +279,7 @@ simple-agent --workspace /path/to/project --graph-status
 - `impact_analysis`：分析修改文件的潜在影响与验证范围
 - `graph_status` / `refresh_project_graph`：查看或增量刷新图谱
 - `project_overview`：读取缓存的项目树、模块、语言、入口和索引状态
-- `query_project_index`：从持久化 FTS5 索引检索相关代码片段
+- `query_project_index`：融合 FTS5/BM25 与 Chroma 检索相关代码片段
 - `search_symbols`：定位类、函数、接口等声明
 - `find_references`：从缓存代码片段查找符号引用
 - `dependency_graph`：查看 import、require、use 等依赖关系
@@ -346,8 +369,8 @@ Planner、Executor、Reflection Reviewer、修复任务和最终结果整理始�
 ├── index/
 │   ├── project-index.db
 │   └── repository-map.json
-├── graph/
-│   └── project-graph.db
+├── vector/
+│   └── <Chroma persistent data>
 ├── knowledge/
 │   └── knowledge.db
 ├── memory/

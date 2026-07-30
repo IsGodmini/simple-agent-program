@@ -1,17 +1,21 @@
 import json
 import unittest
 from argparse import Namespace
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from types import SimpleNamespace
 
+from simple_agent.cli import _handle_graph_actions
 from simple_agent.project_graph import (
-    Neo4jGraphMirror,
+    FileProfile,
+    LLMFileProfileGenerator,
+    Neo4jProjectStore,
     ProjectGraph,
     ProjectGraphConfig,
 )
-from simple_agent.cli import _handle_graph_actions
 from simple_agent.project_index import ProjectIndex
+from simple_agent.vector_store import ChromaVectorStore
 from simple_agent.tools import (
     FileProfileTool,
     ImpactAnalysisTool,
@@ -23,106 +27,294 @@ from simple_agent.tools import (
 from simple_agent.workspace import Workspace
 
 
+class FakeProfileGenerator:
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, records, related_tests, generated_at):
+        self.calls.append([record["path"] for record in records])
+        return [
+            FileProfile(
+                path=record["path"],
+                content_hash=record["content_hash"],
+                language=record["language"],
+                line_count=record["line_count"],
+                purpose=(
+                    "LLM 分析：处理用户认证与登录策略。"
+                    if record["path"] == "src/auth.py"
+                    else f"LLM 分析：实现 {record['path']} 的项目职责。"
+                ),
+                responsibilities=["由 LLM 识别该文件的核心职责"],
+                public_symbols=record["symbols"],
+                imports=[
+                    item["target"] for item in record["imports"]
+                ],
+                related_tests=related_tests.get(record["path"], []),
+                confidence=0.91,
+                evidence=[f"{record['path']}#L1"],
+                stale=False,
+                profile_version=2,
+                updated_at=generated_at,
+            )
+            for record in records
+        ]
+
+
+class InMemoryNeo4jStore:
+    def __init__(self):
+        self.profiles = {}
+        self.records = []
+        self.synced = 0
+        self.stale_paths = []
+
+    def ensure_schema(self):
+        return None
+
+    def fetch_profiles(self, workspace_id):
+        return dict(self.profiles)
+
+    def stage_profiles(self, workspace_id, profiles):
+        self.profiles.update(
+            {
+                profile.path: replace(profile, stale=False)
+                for profile in profiles
+            }
+        )
+
+    def sync_snapshot(
+        self,
+        workspace_id,
+        workspace_path,
+        records,
+        profiles,
+        updated_at,
+    ):
+        self.records = list(records)
+        self.profiles = {
+            profile.path: replace(profile, stale=False)
+            for profile in profiles
+        }
+        self.synced += 1
+
+    def status(self, workspace_id):
+        symbols = sum(len(record["symbols"]) for record in self.records)
+        imports = sum(len(record["imports"]) for record in self.records)
+        tests = sum(
+            len(profile.related_tests) for profile in self.profiles.values()
+        )
+        nodes = 1 + len(self.records) + symbols + imports
+        return {
+            "ready": bool(self.records),
+            "backend": "neo4j",
+            "workspace_id": workspace_id,
+            "profiles": len(self.profiles),
+            "nodes": nodes,
+            "edges": len(self.records) + symbols + imports + tests,
+            "last_refresh": "",
+            "graph_version": 2,
+            "last_error": "",
+        }
+
+    def overview(self, workspace_id, max_profiles):
+        return {
+            **self.status(workspace_id),
+            "edge_types": [{"edge_type": "DEFINES", "count": 3}],
+            "representative_files": [
+                {
+                    "path": profile.path,
+                    "language": profile.language,
+                    "purpose": profile.purpose,
+                    "confidence": profile.confidence,
+                    "stale": False,
+                }
+                for profile in list(self.profiles.values())[:max_profiles]
+            ],
+        }
+
+    def get_profile(self, workspace_id, path):
+        return self.profiles.get(path)
+
+    def mark_profiles_stale(self, workspace_id, paths):
+        self.stale_paths.extend(paths)
+        for path in paths:
+            if path in self.profiles:
+                self.profiles[path] = replace(
+                    self.profiles[path],
+                    stale=True,
+                )
+        return sum(path in self.profiles for path in paths)
+
+    def search_profiles(self, workspace_id, query, limit):
+        terms = [
+            term.strip('"')
+            for term in query.lower().replace(" or ", " ").split()
+        ]
+        return [
+            profile
+            for profile in self.profiles.values()
+            if any(
+                term in (profile.path + " " + profile.purpose).lower()
+                for term in terms
+            )
+        ][:limit]
+
+    def neighbors(self, workspace_id, path, depth, limit):
+        nodes = [
+            {
+                "node_key": f"file:{item.path}",
+                "node_type": "File",
+                "name": Path(item.path).name,
+                "path": item.path,
+                "purpose": item.purpose,
+                "properties": {},
+            }
+            for item in self.profiles.values()
+        ][:limit]
+        edges = []
+        if path == "src/auth.py":
+            edges.extend(
+                [
+                    {
+                        "source_key": "file:src/auth.py",
+                        "target_key": "file:src/service.py",
+                        "edge_type": "DEPENDS_ON",
+                        "evidence": {"line": 2},
+                    },
+                    {
+                        "source_key": "file:tests/test_auth.py",
+                        "target_key": "file:src/auth.py",
+                        "edge_type": "TESTS",
+                        "evidence": {"inferred": True},
+                    },
+                ]
+            )
+        return {
+            "path": path,
+            "depth": depth,
+            "nodes": nodes,
+            "edges": edges,
+        }
+
+
 class ProjectGraphTests(unittest.TestCase):
-    def _project(self, root: Path) -> ProjectGraph:
+    def _project(self, root: Path):
         (root / "src").mkdir()
         (root / "tests").mkdir()
         (root / "src" / "auth.py").write_text(
-            '"""Authenticate users and enforce login policy."""\n'
-            "from .service import check_password\n\n"
-            "class AuthService:\n"
-            "    pass\n",
+            '"""Authenticate users."""\n'
+            "from .service import check_password\n"
+            "class AuthService:\n    pass\n",
             encoding="utf-8",
         )
         (root / "src" / "service.py").write_text(
-            '"""Provide password verification primitives."""\n\n'
-            "def check_password():\n"
-            "    return True\n",
+            "def check_password():\n    return True\n",
             encoding="utf-8",
         )
         (root / "tests" / "test_auth.py").write_text(
-            "from src.auth import AuthService\n\n"
-            "def test_auth_service():\n"
-            "    assert AuthService\n",
+            "from src.auth import AuthService\n",
             encoding="utf-8",
         )
         workspace = Workspace(root)
-        return ProjectGraph(
+        vector_store = ChromaVectorStore(workspace)
+        store = InMemoryNeo4jStore()
+        graph = ProjectGraph(
             workspace,
-            ProjectIndex(workspace),
-            ProjectGraphConfig(),
+            ProjectIndex(workspace, vector_store=vector_store),
+            ProjectGraphConfig(
+                neo4j_uri="neo4j://test",
+                neo4j_username="neo4j",
+                neo4j_password="secret",
+            ),
+            profile_generator=FakeProfileGenerator(),
+            vector_store=vector_store,
+            store=store,
         )
+        return graph, store
 
-    def test_builds_profiles_and_relationship_graph(self):
+    def test_builds_llm_profiles_and_neo4j_relationship_graph(self):
         with TemporaryDirectory() as directory:
-            graph = self._project(Path(directory))
+            graph, store = self._project(Path(directory))
 
             result = graph.refresh()
             profile = graph.get_profile("src/auth.py")
-            matches = graph.search_profiles("authenticate login")
-            neighbors = graph.neighbors("src/auth.py", depth=1)
             impact = graph.impact_analysis("src/auth.py")
 
             self.assertEqual(result.updated_profiles, 3)
-            self.assertGreaterEqual(result.nodes, 7)
-            self.assertGreaterEqual(result.edges, 8)
-            self.assertIn("Authenticate users", profile.purpose)
-            self.assertEqual(
-                profile.related_tests,
-                ["tests/test_auth.py"],
-            )
-            self.assertEqual(matches[0].path, "src/auth.py")
-            edge_types = {edge["edge_type"] for edge in neighbors["edges"]}
-            self.assertIn("DEPENDS_ON", edge_types)
-            self.assertIn("TESTS", edge_types)
+            self.assertEqual(result.backend, "neo4j")
+            self.assertTrue(result.neo4j_synced)
+            self.assertEqual(store.synced, 1)
+            self.assertIn("LLM 分析", profile.purpose)
             self.assertIn("tests/test_auth.py", impact["related_tests"])
 
-    def test_unchanged_refresh_does_not_read_source_content(self):
+    def test_unchanged_files_do_not_regenerate_profiles(self):
         with TemporaryDirectory() as directory:
-            graph = self._project(Path(directory))
+            graph, store = self._project(Path(directory))
             graph.refresh()
-            original = Path.read_bytes
 
-            def guarded(path):
-                if str(path).endswith((".py", ".js", ".ts")):
-                    raise AssertionError(f"unexpected reread: {path}")
-                return original(path)
-
-            with patch.object(Path, "read_bytes", guarded):
-                result = graph.refresh()
+            result = graph.refresh()
 
             self.assertEqual(result.updated_profiles, 0)
             self.assertEqual(result.unchanged_profiles, 3)
+            self.assertEqual(store.synced, 1)
 
-    def test_changed_and_deleted_files_update_profiles(self):
+    def test_changed_and_deleted_files_update_neo4j_snapshot(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            graph = self._project(root)
+            graph, store = self._project(root)
             graph.refresh()
-            service = root / "src" / "service.py"
-            service.write_text(
-                '"""Verify passwords and lock compromised accounts."""\n\n'
-                "def check_password():\n"
-                "    return False\n",
+            (root / "src" / "service.py").write_text(
+                "def check_password():\n    return False\n",
                 encoding="utf-8",
             )
 
             changed = graph.refresh(["src/service.py"])
-            service_profile = graph.get_profile("src/service.py")
             (root / "src" / "auth.py").unlink()
             deleted = graph.refresh(["src/auth.py"])
 
             self.assertEqual(changed.updated_profiles, 1)
-            self.assertIn("lock compromised", service_profile.purpose)
             self.assertEqual(deleted.deleted_profiles, 1)
-            self.assertIsNone(graph.get_profile("src/auth.py"))
+            self.assertNotIn("src/auth.py", store.profiles)
 
-    def test_graph_tools_return_bounded_json_results(self):
+    def test_source_change_defers_llm_profile_generation_until_batch_refresh(self):
         with TemporaryDirectory() as directory:
-            graph = self._project(Path(directory))
-            refresh = json.loads(
-                RefreshProjectGraphTool(graph).execute({})
+            root = Path(directory)
+            graph, store = self._project(root)
+            graph.refresh()
+            generator = graph.profile_generator
+            initial_calls = len(generator.calls)
+            (root / "src" / "auth.py").write_text(
+                "def login(token):\n    return bool(token)\n",
+                encoding="utf-8",
             )
+
+            graph.record_source_change("src/auth.py")
+
+            self.assertEqual(len(generator.calls), initial_calls)
+            self.assertEqual(store.stale_paths, ["src/auth.py"])
+
+            graph.refresh(["src/auth.py"])
+
+            self.assertEqual(len(generator.calls), initial_calls + 1)
+            self.assertEqual(generator.calls[-1], ["src/auth.py"])
+
+    def test_stale_profile_with_same_hash_is_cleared_without_llm(self):
+        with TemporaryDirectory() as directory:
+            graph, store = self._project(Path(directory))
+            graph.refresh()
+            generator = graph.profile_generator
+            initial_calls = len(generator.calls)
+
+            graph.record_source_change("src/auth.py")
+            result = graph.refresh(["src/auth.py"])
+
+            self.assertEqual(len(generator.calls), initial_calls)
+            self.assertEqual(result.updated_profiles, 0)
+            self.assertFalse(store.profiles["src/auth.py"].stale)
+
+    def test_graph_tools_use_neo4j_results(self):
+        with TemporaryDirectory() as directory:
+            graph, _ = self._project(Path(directory))
+            refresh = json.loads(RefreshProjectGraphTool(graph).execute({}))
             overview = json.loads(
                 ProjectGraphOverviewTool(graph).execute(
                     {"max_profiles": 2}
@@ -130,7 +322,7 @@ class ProjectGraphTests(unittest.TestCase):
             )
             profiles = json.loads(
                 QueryFileProfilesTool(graph).execute(
-                    {"query": "login", "limit": 2}
+                    {"query": "auth", "limit": 2}
                 )
             )
             profile = json.loads(
@@ -151,12 +343,12 @@ class ProjectGraphTests(unittest.TestCase):
             self.assertEqual(len(overview["representative_files"]), 2)
             self.assertEqual(profiles[0]["path"], "src/auth.py")
             self.assertEqual(profile["citation"], "graph:src/auth.py")
-            self.assertLessEqual(len(relations["nodes"]), 20)
+            self.assertTrue(relations["edges"])
             self.assertIn("tests/test_auth.py", impact["related_tests"])
 
-    def test_cli_refreshes_and_reports_graph_status(self):
+    def test_cli_reports_neo4j_status(self):
         with TemporaryDirectory() as directory:
-            graph = self._project(Path(directory))
+            graph, _ = self._project(Path(directory))
 
             output = _handle_graph_actions(
                 Namespace(refresh_graph=True, graph_status=True),
@@ -164,31 +356,10 @@ class ProjectGraphTests(unittest.TestCase):
             )
 
             self.assertIn("项目图谱已增量刷新", output)
-            self.assertIn("项目图谱状态", output)
+            self.assertIn('"backend": "neo4j"', output)
             self.assertIn('"profiles": 3', output)
 
-    def test_graph_storage_rejects_symbolic_links(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory) / "workspace"
-            outside = Path(directory) / "outside"
-            root.mkdir()
-            outside.mkdir()
-            state = root / ".simple-agent"
-            state.mkdir()
-            (state / "graph").symlink_to(outside, target_is_directory=True)
-            workspace = Workspace(root)
-            graph = ProjectGraph(
-                workspace,
-                ProjectIndex(workspace),
-                ProjectGraphConfig(),
-            )
-
-            with self.assertRaisesRegex(ValueError, "symbolic links"):
-                graph.status()
-
-
-class Neo4jMirrorTests(unittest.TestCase):
-    def test_default_backend_falls_back_when_neo4j_is_not_configured(self):
+    def test_missing_neo4j_configuration_has_no_sqlite_fallback(self):
         with TemporaryDirectory() as directory:
             workspace = Workspace(Path(directory))
             graph = ProjectGraph(
@@ -197,147 +368,160 @@ class Neo4jMirrorTests(unittest.TestCase):
                 ProjectGraphConfig(),
             )
 
+            result = graph.refresh()
             status = graph.status()
 
-            self.assertEqual(status["requested_backend"], "neo4j")
-            self.assertEqual(status["backend"], "sqlite")
-            self.assertTrue(status["fallback_active"])
-            self.assertIn("NEO4J_URI", status["fallback_reason"])
-
-    def test_explicit_sqlite_does_not_report_fallback(self):
-        with TemporaryDirectory() as directory:
-            workspace = Workspace(Path(directory))
-            graph = ProjectGraph(
-                workspace,
-                ProjectIndex(workspace),
-                ProjectGraphConfig(backend="sqlite"),
+            self.assertFalse(result.neo4j_synced)
+            self.assertEqual(status["storage"], "neo4j-only")
+            self.assertEqual(status["backend"], "neo4j")
+            self.assertNotIn("fallback", json.dumps(status))
+            self.assertFalse(
+                (workspace.root / ".simple-agent" / "graph").exists()
             )
 
-            status = graph.status()
 
-            self.assertEqual(status["backend"], "sqlite")
-            self.assertFalse(status["fallback_active"])
+class LLMProfileGeneratorTests(unittest.TestCase):
+    def test_generates_purpose_and_responsibilities_from_model_json(self):
+        class FakeModel:
+            def complete(self, messages, tools=None):
+                return SimpleNamespace(
+                    content=json.dumps(
+                        [
+                            {
+                                "path": "app.py",
+                                "purpose": "启动 HTTP 服务并装配路由。",
+                                "responsibilities": ["创建应用", "注册路由"],
+                                "confidence": 0.95,
+                                "evidence": ["app.py#L1"],
+                            }
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
 
-    def test_mirror_uses_constraint_and_parameterized_snapshot(self):
+        profiles = LLMFileProfileGenerator(FakeModel()).generate(
+            [
+                {
+                    "path": "app.py",
+                    "content_hash": "hash",
+                    "language": "Python",
+                    "line_count": 10,
+                    "symbols": [],
+                    "imports": [],
+                    "leading_content": "create_app()",
+                }
+            ],
+            {},
+            "now",
+        )
+
+        self.assertEqual(profiles[0].purpose, "启动 HTTP 服务并装配路由。")
+        self.assertEqual(profiles[0].profile_version, 2)
+
+
+class Neo4jStoreTests(unittest.TestCase):
+    def test_uses_constraints_fulltext_and_real_relationship_types(self):
         class FakeDriver:
             def __init__(self):
                 self.calls = []
-                self.verified = False
-                self.closed = False
 
             def verify_connectivity(self):
-                self.verified = True
+                return None
 
             def execute_query(self, query, **kwargs):
                 self.calls.append((query, kwargs))
-                return [], None, []
+                return ([], None, [])
+
+            def session(self, database):
+                driver = self
+
+                class Result:
+                    def consume(self):
+                        return None
+
+                class Transaction:
+                    def run(self, query, **parameters):
+                        driver.calls.append(
+                            (query, {"parameters_": parameters})
+                        )
+                        return Result()
+
+                    def commit(self):
+                        return None
+
+                    def rollback(self):
+                        return None
+
+                class Session:
+                    def begin_transaction(self):
+                        return Transaction()
+
+                    def close(self):
+                        return None
+
+                return Session()
 
             def close(self):
-                self.closed = True
+                return None
 
         driver = FakeDriver()
-        created = {}
-
-        def factory(uri, auth):
-            created["uri"] = uri
-            created["auth"] = auth
-            return driver
-
-        config = ProjectGraphConfig(
-            backend="neo4j",
-            neo4j_uri="neo4j://localhost:7687",
-            neo4j_username="neo4j",
-            neo4j_password="secret",
+        store = Neo4jProjectStore(
+            ProjectGraphConfig(
+                neo4j_uri="neo4j://test",
+                neo4j_username="neo4j",
+                neo4j_password="secret",
+            ),
+            driver_factory=lambda uri, auth: driver,
         )
-        mirror = Neo4jGraphMirror(config, driver_factory=factory)
-        mirror.sync_snapshot(
-            "workspace-id",
+        store.ensure_schema()
+        profile = FileProfile(
+            path="app.py",
+            content_hash="hash",
+            language="Python",
+            line_count=1,
+            purpose="入口",
+            responsibilities=["启动"],
+            public_symbols=[],
+            imports=[],
+            related_tests=[],
+            confidence=0.9,
+            evidence=["app.py#L1"],
+            stale=False,
+            profile_version=2,
+            updated_at="now",
+        )
+        store.sync_snapshot(
+            "workspace",
             "/workspace",
             [
                 {
-                    "node_key": "file:app.py",
-                    "node_type": "File",
-                    "name": "app.py",
                     "path": "app.py",
-                    "purpose": "entrypoint",
                     "content_hash": "hash",
-                    "properties_json": json.dumps({}),
+                    "language": "Python",
+                    "line_count": 1,
+                    "symbols": [
+                        {
+                            "name": "main",
+                            "kind": "function",
+                            "line": 1,
+                            "signature": "def main():",
+                        }
+                    ],
+                    "imports": [],
                 }
             ],
-            [],
+            [profile],
+            "now",
         )
-        mirror.close()
 
-        self.assertEqual(created["auth"], ("neo4j", "secret"))
-        self.assertTrue(driver.verified)
-        self.assertEqual(len(driver.calls), 2)
-        parameters = driver.calls[1][1]["parameters_"]
-        self.assertEqual(parameters["workspace_id"], "workspace-id")
-        self.assertEqual(parameters["nodes"][0]["path"], "app.py")
+        queries = "\n".join(call[0] for call in driver.calls)
+        self.assertIn("CREATE CONSTRAINT", queries)
+        self.assertIn("CREATE FULLTEXT INDEX", queries)
+        self.assertIn("CREATE (source)-[r:CONTAINS]", queries)
+        self.assertIn("CREATE (source)-[r:DEFINES]", queries)
+        self.assertIn("SET n:ProjectSymbol", queries)
+        self.assertIn("SET n:ProjectModule", queries)
         self.assertNotIn("secret", str(driver.calls))
-        self.assertTrue(driver.closed)
-
-    def test_mirror_error_redacts_password_before_persistence(self):
-        with TemporaryDirectory() as directory:
-            workspace = Workspace(Path(directory))
-            graph = ProjectGraph(
-                workspace,
-                ProjectIndex(workspace),
-                ProjectGraphConfig(
-                    backend="neo4j",
-                    neo4j_uri="neo4j://localhost:7687",
-                    neo4j_username="neo4j",
-                    neo4j_password="top-secret",
-                ),
-            )
-
-            message = graph._safe_mirror_error(
-                RuntimeError("authentication failed for top-secret")
-            )
-
-            self.assertNotIn("top-secret", message)
-            self.assertIn("[redacted]", message)
-
-    def test_sync_failure_falls_back_and_next_refresh_recovers(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "app.py").write_text(
-                '"""Application entry point."""\n',
-                encoding="utf-8",
-            )
-            workspace = Workspace(root)
-            graph = ProjectGraph(
-                workspace,
-                ProjectIndex(workspace),
-                ProjectGraphConfig(
-                    backend="neo4j",
-                    neo4j_uri="neo4j://localhost:7687",
-                    neo4j_username="neo4j",
-                    neo4j_password="secret",
-                ),
-            )
-
-            with patch.object(
-                graph,
-                "_sync_neo4j",
-                side_effect=RuntimeError("connection unavailable"),
-            ):
-                failed = graph.refresh()
-
-            self.assertEqual(failed.backend, "sqlite")
-            self.assertTrue(graph.status()["fallback_active"])
-            self.assertIn(
-                "connection unavailable",
-                graph.status()["fallback_reason"],
-            )
-
-            with patch.object(graph, "_sync_neo4j") as sync:
-                recovered = graph.refresh()
-
-            sync.assert_called_once()
-            self.assertEqual(recovered.backend, "neo4j")
-            self.assertFalse(graph.status()["fallback_active"])
-            self.assertTrue(recovered.neo4j_synced)
 
 
 if __name__ == "__main__":

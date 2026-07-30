@@ -24,6 +24,7 @@ class ProjectIndexTests(unittest.TestCase):
             root = Path(directory)
             (root / "src").mkdir()
             (root / "node_modules").mkdir()
+            (root / "example.egg-info").mkdir()
             (root / "README.md").write_text(
                 "# Example service\n", encoding="utf-8"
             )
@@ -45,6 +46,9 @@ class ProjectIndexTests(unittest.TestCase):
             (root / "node_modules" / "secret.js").write_text(
                 "const dependencySecret = true;\n", encoding="utf-8"
             )
+            (root / "example.egg-info" / "dependency_links.txt").write_text(
+                "\n", encoding="utf-8"
+            )
             index = ProjectIndex(Workspace(root))
 
             refreshed = index.refresh()
@@ -57,6 +61,7 @@ class ProjectIndexTests(unittest.TestCase):
             self.assertEqual(overview["modules"][0]["symbols"], 3)
             self.assertNotIn(".env", json.dumps(overview))
             self.assertNotIn("node_modules", json.dumps(overview))
+            self.assertNotIn("egg-info", json.dumps(overview))
 
             hits = index.search("authenticate token")
             self.assertTrue(any(hit.path == "src/auth.py" for hit in hits))

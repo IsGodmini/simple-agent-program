@@ -85,8 +85,7 @@ function updateMemoryStatus() {
     : "索引待初始化";
   const graphed = state.projectGraph && state.projectGraph.ready
     ? `${state.projectGraph.profiles} 文件档案 / ${state.projectGraph.edges} 关系 / `
-      + `${state.projectGraph.backend === "neo4j" ? "Neo4j" : "SQLite"}`
-      + `${state.projectGraph.fallback_active ? "（降级）" : ""}`
+      + "Neo4j"
     : "图谱待初始化";
   elements.memoryStatus.textContent = (
     `${state.sessions.length} 会话 · ${state.knowledge.length} 资料 · `

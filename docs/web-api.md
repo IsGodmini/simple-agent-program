@@ -212,5 +212,5 @@ curl -X POST \
   'http://127.0.0.1:8765/api/project-graph/refresh?workspace=/path/to/project'
 ```
 
-图谱响应包含文件档案、节点、边、关系类型，以及 Neo4j/SQLite 活动后端、
-自动降级原因和最近同步状态。
+图谱响应包含 Neo4j 文件档案、节点、真实关系类型、最近同步错误和独立 Chroma
+向量状态。Neo4j 不可用时不会返回 SQLite 图谱结果。

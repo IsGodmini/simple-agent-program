@@ -92,7 +92,7 @@ def build_agent(
             ReadFileTool(workspace),
             ApplyPatchTool(
                 workspace,
-                on_change=lambda path: project_graph.refresh([path]),
+                on_change=project_graph.record_source_change,
             ),
             RunCommandTool(workspace),
             SearchKnowledgeTool(knowledge_base),

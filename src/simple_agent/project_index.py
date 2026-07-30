@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .workspace import Workspace
+from .vector_store import (
+    ChromaVectorStore,
+    VectorRecord,
+    content_fingerprint,
+    reciprocal_rank_fusion,
+)
 
 INDEX_VERSION = 1
 DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -190,6 +196,7 @@ class ProjectIndex:
         workspace: Workspace,
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
         chunk_chars: int = DEFAULT_CHUNK_CHARS,
+        vector_store: Optional[ChromaVectorStore] = None,
     ) -> None:
         if max_file_bytes < 1:
             raise ValueError("max_file_bytes must be positive")
@@ -201,10 +208,14 @@ class ProjectIndex:
         self.map_path = self.root / "repository-map.json"
         self.max_file_bytes = max_file_bytes
         self.chunk_chars = chunk_chars
+        self.vector_store = vector_store or ChromaVectorStore.from_env(workspace)
+        self.vector_error = ""
 
     def refresh(
         self,
         paths: Optional[Sequence[str]] = None,
+        *,
+        sync_vectors: bool = True,
     ) -> IndexRefreshResult:
         started = time.monotonic()
         full_refresh = paths is None
@@ -357,7 +368,17 @@ class ProjectIndex:
         )
         if indexed or deleted or skipped or not self.map_path.exists():
             self._write_map(result)
+        if sync_vectors and (indexed or deleted):
+            self.sync_vector_index()
         return result
+
+    def sync_vector_index(self) -> None:
+        """Synchronize changed cached chunks with Chroma."""
+        try:
+            self._sync_vectors()
+            self.vector_error = ""
+        except Exception as exc:
+            self.vector_error = f"{type(exc).__name__}: {exc}"[:2_000]
 
     def status(self) -> Dict[str, Any]:
         self._ensure_storage_path()
@@ -403,6 +424,10 @@ class ProjectIndex:
             "index_version": int(
                 metadata.get("index_version", INDEX_VERSION)
             ),
+            "vector": {
+                **self.vector_store.status(),
+                "last_error": self.vector_error,
+            },
         }
 
     def overview(
@@ -584,6 +609,67 @@ class ProjectIndex:
             for row in rows
         ]
 
+    def search_hybrid(
+        self,
+        query: str,
+        limit: int = 8,
+    ) -> List[ProjectCodeHit]:
+        """Fuse FTS5/BM25 and Chroma dense-vector rankings."""
+        keyword_hits = self.search(query, min(30, max(limit * 3, limit)))
+        try:
+            vector_hits = self.vector_store.query(
+                "code_chunks",
+                query,
+                min(30, max(limit * 3, limit)),
+            )
+            self.vector_error = ""
+        except Exception as exc:
+            self.vector_error = f"{type(exc).__name__}: {exc}"[:2_000]
+            vector_hits = []
+        keyword_ids = [
+            f"{hit.path}:{hit.chunk_index}" for hit in keyword_hits
+        ]
+        vector_ids = [
+            f"{hit.metadata.get('path', '')}:"
+            f"{int(hit.metadata.get('chunk_index', 0))}"
+            for hit in vector_hits
+        ]
+        fused = reciprocal_rank_fusion([keyword_ids, vector_ids])
+        candidates = {
+            f"{hit.path}:{hit.chunk_index}": hit for hit in keyword_hits
+        }
+        for hit in vector_hits:
+            path = str(hit.metadata.get("path", ""))
+            chunk_index = int(hit.metadata.get("chunk_index", 0))
+            key = f"{path}:{chunk_index}"
+            if key in candidates or not path or chunk_index < 0:
+                continue
+            candidates[key] = ProjectCodeHit(
+                path=path,
+                chunk_index=chunk_index,
+                start_line=int(hit.metadata.get("start_line", 1)),
+                end_line=int(hit.metadata.get("end_line", 1)),
+                language=str(hit.metadata.get("language", "")),
+                content=hit.text,
+                score=0.0,
+            )
+        ordered = sorted(
+            candidates.items(),
+            key=lambda item: (-fused.get(item[0], 0.0), item[0]),
+        )
+        return [
+            ProjectCodeHit(
+                path=hit.path,
+                chunk_index=hit.chunk_index,
+                start_line=hit.start_line,
+                end_line=hit.end_line,
+                language=hit.language,
+                content=hit.content,
+                score=round(fused.get(key, 0.0), 8),
+            )
+            for key, hit in ordered[:limit]
+        ]
+
     def search_symbols(
         self,
         query: str,
@@ -613,6 +699,59 @@ class ProjectIndex:
                 (f"%{escaped}%", query.strip(), limit),
             ).fetchall()
         return [ProjectSymbol(**dict(row)) for row in rows]
+
+    def file_evidence_records(self) -> List[Dict[str, Any]]:
+        """Return cached source evidence used by higher-level analyzers."""
+        if not self.database_path.exists():
+            return []
+        with self._connect() as connection:
+            files = connection.execute(
+                """
+                SELECT path, content_hash, language, line_count
+                FROM files WHERE indexed = 1 ORDER BY path
+                """
+            ).fetchall()
+            records = []
+            for file_row in files:
+                path = file_row["path"]
+                symbols = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT name, kind, line, signature FROM symbols
+                        WHERE path = ? ORDER BY line, name
+                        """,
+                        (path,),
+                    )
+                ]
+                imports = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT target, line, kind FROM imports
+                        WHERE path = ? ORDER BY line, target
+                        """,
+                        (path,),
+                    )
+                ]
+                chunks = connection.execute(
+                    """
+                    SELECT content FROM chunks WHERE path = ?
+                    ORDER BY chunk_index LIMIT 2
+                    """,
+                    (path,),
+                ).fetchall()
+                records.append(
+                    {
+                        **dict(file_row),
+                        "symbols": symbols,
+                        "imports": imports,
+                        "leading_content": "\n".join(
+                            row["content"] for row in chunks
+                        )[:12_000],
+                    }
+                )
+            return records
 
     def find_references(
         self,
@@ -847,6 +986,44 @@ class ProjectIndex:
             (relative, size, mtime_ns, language, indexed_at),
         )
 
+    def _sync_vectors(self) -> None:
+        if not self.vector_store.available or not self.database_path.exists():
+            return
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.path, c.chunk_index, c.start_line, c.end_line,
+                       c.content, f.content_hash, f.language
+                FROM chunks c
+                JOIN files f ON f.path = c.path
+                ORDER BY c.path, c.chunk_index
+                """
+            ).fetchall()
+        records = [
+            VectorRecord(
+                id=content_fingerprint(
+                    "code",
+                    row["path"],
+                    str(row["chunk_index"]),
+                ),
+                text=row["content"],
+                content_hash=content_fingerprint(
+                    row["content_hash"],
+                    str(row["chunk_index"]),
+                    row["content"],
+                ),
+                metadata={
+                    "path": row["path"],
+                    "chunk_index": row["chunk_index"],
+                    "start_line": row["start_line"],
+                    "end_line": row["end_line"],
+                    "language": row["language"],
+                },
+            )
+            for row in rows
+        ]
+        self.vector_store.sync_namespace("code_chunks", records)
+
     @staticmethod
     def _delete_file(
         connection: sqlite3.Connection,
@@ -966,6 +1143,7 @@ class ProjectIndex:
         return any(
             part in DENIED_NAMES
             or part in GENERATED_DIRS
+            or part.endswith(".egg-info")
             or _is_sensitive_name(part)
             for part in parts
         )
@@ -974,7 +1152,9 @@ class ProjectIndex:
     def _skip_name(name: str, is_directory: bool) -> bool:
         if name in DENIED_NAMES or _is_sensitive_name(name):
             return True
-        if is_directory and name in GENERATED_DIRS:
+        if is_directory and (
+            name in GENERATED_DIRS or name.endswith(".egg-info")
+        ):
             return True
         return (
             not is_directory

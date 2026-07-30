@@ -92,6 +92,11 @@ class SessionManager:
     ) -> TaskSummary:
         finished_at = datetime.now(timezone.utc).isoformat()
         files_changed = self._files_changed(result.tool_executions)
+        graph_refresh = (
+            asdict(self.project_graph.refresh(files_changed))
+            if files_changed
+            else None
+        )
         validations = self._validations(result.tool_executions)
         verification = self._verification(result, validations)
         summary = TaskSummary(
@@ -127,6 +132,7 @@ class SessionManager:
                 "compactions": result.compactions,
                 "workflow": result.workflow,
                 "files_changed": files_changed,
+                "project_graph_refresh": graph_refresh,
                 "validations": validations,
                 "tool_executions": [
                     asdict(execution) for execution in result.tool_executions

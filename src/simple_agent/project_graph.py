@@ -1,44 +1,60 @@
-"""Persistent project knowledge graph and versioned file-function profiles."""
+"""Neo4j project graph with LLM-generated file profiles."""
 
 import hashlib
 import json
 import os
 import re
-import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Set, Tuple
 
+from dotenv import load_dotenv
+
+from .config import Settings
+from .llm import ChatModel, OpenAICompatibleLLM
 from .project_index import ProjectIndex
+from .vector_store import (
+    ChromaVectorStore,
+    VectorRecord,
+    content_fingerprint,
+    reciprocal_rank_fusion,
+)
 from .workspace import Workspace
 
-GRAPH_VERSION = 1
-PROFILE_VERSION = 1
+GRAPH_VERSION = 2
+PROFILE_VERSION = 2
 DEFAULT_PROFILE_LIMIT = 6
 MAX_PROFILE_RESULTS = 30
-MAX_GRAPH_NODES = 500_000
-MAX_GRAPH_EDGES = 1_000_000
+PROFILE_BATCH_SIZE = 2
+PROFILE_MAX_CONCURRENCY = 3
+PROFILE_MAX_OUTPUT_TOKENS = 6_000
+PROFILE_SOURCE_EXCERPT_CHARS = 4_000
 
 
 @dataclass(frozen=True)
 class ProjectGraphConfig:
-    """Neo4j-first graph configuration with a local SQLite fallback."""
+    """Required Neo4j configuration; no local graph fallback is provided."""
 
-    backend: str = "neo4j"
     neo4j_uri: str = ""
     neo4j_username: str = ""
     neo4j_password: str = ""
     neo4j_database: str = "neo4j"
 
-    def __post_init__(self) -> None:
-        if self.backend not in {"sqlite", "neo4j"}:
-            raise ValueError(
-                "PROJECT_GRAPH_BACKEND must be sqlite or neo4j"
-            )
+    @classmethod
+    def from_env(cls) -> "ProjectGraphConfig":
+        load_dotenv()
+        return cls(
+            neo4j_uri=os.getenv("NEO4J_URI", ""),
+            neo4j_username=os.getenv("NEO4J_USERNAME", ""),
+            neo4j_password=os.getenv("NEO4J_PASSWORD", ""),
+            neo4j_database=os.getenv("NEO4J_DATABASE", "neo4j"),
+        )
+
     @property
-    def missing_neo4j_settings(self) -> List[str]:
+    def missing_settings(self) -> List[str]:
         return [
             name
             for name, value in (
@@ -50,27 +66,12 @@ class ProjectGraphConfig:
         ]
 
     @property
-    def neo4j_configured(self) -> bool:
-        return (
-            self.backend == "neo4j"
-            and not self.missing_neo4j_settings
-        )
-
-    @classmethod
-    def from_env(cls) -> "ProjectGraphConfig":
-        return cls(
-            backend=os.getenv("PROJECT_GRAPH_BACKEND", "neo4j").lower(),
-            neo4j_uri=os.getenv("NEO4J_URI", ""),
-            neo4j_username=os.getenv("NEO4J_USERNAME", ""),
-            neo4j_password=os.getenv("NEO4J_PASSWORD", ""),
-            neo4j_database=os.getenv("NEO4J_DATABASE", "neo4j"),
-        )
+    def configured(self) -> bool:
+        return not self.missing_settings
 
 
 @dataclass(frozen=True)
 class FileProfile:
-    """One content-hash-bound explanation of a project file."""
-
     path: str
     content_hash: str
     language: str
@@ -93,8 +94,6 @@ class FileProfile:
 
 @dataclass(frozen=True)
 class GraphRefreshResult:
-    """Statistics for one graph synchronization."""
-
     scanned_files: int
     updated_profiles: int
     unchanged_profiles: int
@@ -103,28 +102,191 @@ class GraphRefreshResult:
     edges: int
     duration_ms: int
     backend: str
-    requested_backend: str
-    fallback_reason: str
     neo4j_synced: bool
     refreshed_at: str
+    error: str = ""
 
 
-class Neo4jGraphMirror:
-    """Mirror one workspace graph into Neo4j using the official driver."""
+class FileProfileGenerator(Protocol):
+    def generate(
+        self,
+        records: Sequence[Dict[str, Any]],
+        related_tests: Dict[str, List[str]],
+        generated_at: str,
+    ) -> List[FileProfile]:
+        """Generate profiles for changed files."""
+
+
+class LLMFileProfileGenerator:
+    """Generate bounded, evidence-oriented file descriptions in batches."""
+
+    def __init__(
+        self,
+        model: Optional[ChatModel] = None,
+        batch_size: int = PROFILE_BATCH_SIZE,
+    ) -> None:
+        self.model = model
+        self.batch_size = batch_size
+
+    def generate(
+        self,
+        records: Sequence[Dict[str, Any]],
+        related_tests: Dict[str, List[str]],
+        generated_at: str,
+    ) -> List[FileProfile]:
+        if not records:
+            return []
+        self._ensure_model()
+        batches = [
+            list(records[offset : offset + self.batch_size])
+            for offset in range(0, len(records), self.batch_size)
+        ]
+        if len(batches) == 1:
+            generated_batches = [self._complete(batches[0])]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(PROFILE_MAX_CONCURRENCY, len(batches)),
+                thread_name_prefix="file-profile",
+            ) as executor:
+                generated_batches = list(executor.map(self._complete, batches))
+        profiles: List[FileProfile] = []
+        for batch, generated in zip(batches, generated_batches):
+            by_path = {
+                item.get("path"): item
+                for item in generated
+                if isinstance(item, dict)
+            }
+            missing = [
+                record["path"]
+                for record in batch
+                if record["path"] not in by_path
+            ]
+            if missing:
+                raise RuntimeError(
+                    "LLM file profile response omitted: "
+                    + ", ".join(missing)
+                )
+            for record in batch:
+                item = by_path[record["path"]]
+                purpose = str(item.get("purpose", "")).strip()
+                responsibilities = _string_list(
+                    item.get("responsibilities"),
+                    limit=12,
+                )
+                evidence = _string_list(item.get("evidence"), limit=20)
+                if not purpose or not responsibilities:
+                    raise RuntimeError(
+                        "LLM returned an incomplete profile for "
+                        + record["path"]
+                    )
+                if not evidence:
+                    evidence = [
+                        f"{record['path']}#L{symbol['line']}"
+                        for symbol in record["symbols"][:10]
+                    ] or [f"{record['path']}#L1"]
+                profiles.append(
+                    FileProfile(
+                        path=record["path"],
+                        content_hash=record["content_hash"],
+                        language=record["language"],
+                        line_count=record["line_count"],
+                        purpose=purpose[:1_000],
+                        responsibilities=responsibilities,
+                        public_symbols=record["symbols"][:100],
+                        imports=list(
+                            dict.fromkeys(
+                                imported["target"]
+                                for imported in record["imports"]
+                            )
+                        )[:100],
+                        related_tests=related_tests.get(
+                            record["path"],
+                            [],
+                        ),
+                        confidence=_confidence(item.get("confidence")),
+                        evidence=evidence,
+                        stale=False,
+                        profile_version=PROFILE_VERSION,
+                        updated_at=generated_at,
+                    )
+                )
+        return profiles
+
+    def _ensure_model(self) -> None:
+        if self.model is None:
+            settings = replace(
+                Settings.from_env(),
+                max_output_tokens=PROFILE_MAX_OUTPUT_TOKENS,
+            )
+            self.model = OpenAICompatibleLLM(
+                settings,
+                timeout=180.0,
+                max_retries=0,
+            )
+
+    def _complete(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        assert self.model is not None
+        payload = [
+            {
+                "path": record["path"],
+                "language": record["language"],
+                "line_count": record["line_count"],
+                "symbols": record["symbols"][:60],
+                "imports": record["imports"][:60],
+                "source_excerpt": record["leading_content"][
+                    :PROFILE_SOURCE_EXCERPT_CHARS
+                ],
+            }
+            for record in records
+        ]
+        response = self.model.complete(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是代码库文件职责分析器。根据提供的源码证据，为每个"
+                        "文件生成准确、简洁的中文功能档案。不得猜测未出现的"
+                        "实现。只输出 JSON 数组；每项包含 path、purpose、"
+                        "responsibilities、confidence、evidence。evidence 使用"
+                        " path#L<行号>。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+            ]
+        )
+        content = (
+            response.get("content", "")
+            if isinstance(response, dict)
+            else getattr(response, "content", "")
+        )
+        parsed = json.loads(_strip_json_fence(content))
+        if not isinstance(parsed, list):
+            raise RuntimeError("LLM file profile response must be a JSON array")
+        return parsed
+
+
+class Neo4jProjectStore:
+    """All graph nodes, relationships, and file profiles live in Neo4j."""
 
     def __init__(
         self,
         config: ProjectGraphConfig,
         driver_factory: Optional[Any] = None,
     ) -> None:
+        if not config.configured:
+            raise RuntimeError(
+                "Neo4j graph requires " + ", ".join(config.missing_settings)
+            )
         self.config = config
         if driver_factory is None:
             try:
                 from neo4j import GraphDatabase
             except ImportError as exc:
                 raise RuntimeError(
-                    "Neo4j backend requires the 'neo4j' package; "
-                    "install project dependencies with 'pip install -e .'"
+                    "Neo4j graph requires the neo4j package"
                 ) from exc
             driver_factory = GraphDatabase.driver
         self.driver = driver_factory(
@@ -135,335 +297,575 @@ class Neo4jGraphMirror:
     def close(self) -> None:
         self.driver.close()
 
+    def ensure_schema(self) -> None:
+        self.driver.verify_connectivity()
+        statements = [
+            """
+            CREATE CONSTRAINT sa_node_key IF NOT EXISTS
+            FOR (n:ProjectNode)
+            REQUIRE (n.workspace_id, n.node_key) IS UNIQUE
+            """,
+            """
+            CREATE FULLTEXT INDEX sa_file_profile_search IF NOT EXISTS
+            FOR (n:ProjectFile)
+            ON EACH [n.path, n.purpose, n.responsibilities_text]
+            """,
+        ]
+        for statement in statements:
+            self._query(statement)
+
+    def status(self, workspace_id: str) -> Dict[str, Any]:
+        records = self._query(
+            """
+            OPTIONAL MATCH (n:ProjectNode {workspace_id: $workspace_id})
+            WITH count(n) AS nodes
+            OPTIONAL MATCH ()-[r]->()
+            WHERE r.workspace_id = $workspace_id
+            WITH nodes, count(r) AS edges
+            OPTIONAL MATCH (
+                w:ProjectWorkspace {workspace_id: $workspace_id}
+            )
+            RETURN nodes, edges, w.updated_at AS last_refresh,
+                   w.graph_version AS graph_version,
+                   w.last_error AS last_error
+            """,
+            {"workspace_id": workspace_id},
+        )
+        row = records[0] if records else {}
+        nodes = int(row.get("nodes") or 0)
+        profiles = self._query(
+            """
+            MATCH (f:ProjectFile {workspace_id: $workspace_id})
+            RETURN count(f) AS profiles
+            """,
+            {"workspace_id": workspace_id},
+        )
+        return {
+            "ready": int(row.get("graph_version") or 0) == GRAPH_VERSION,
+            "backend": "neo4j",
+            "workspace_id": workspace_id,
+            "profiles": int(profiles[0].get("profiles") or 0)
+            if profiles
+            else 0,
+            "nodes": nodes,
+            "edges": int(row.get("edges") or 0),
+            "last_refresh": row.get("last_refresh") or "",
+            "graph_version": int(row.get("graph_version") or 0),
+            "last_error": row.get("last_error") or "",
+        }
+
+    def fetch_profiles(self, workspace_id: str) -> Dict[str, FileProfile]:
+        rows = self._query(
+            """
+            MATCH (f:ProjectFile {workspace_id: $workspace_id})
+            RETURN f
+            """,
+            {"workspace_id": workspace_id},
+        )
+        return {
+            profile.path: profile
+            for profile in (
+                _profile_from_node(_node_dict(row["f"])) for row in rows
+            )
+        }
+
+    def stage_profiles(
+        self,
+        workspace_id: str,
+        profiles: Sequence[FileProfile],
+    ) -> None:
+        """Persist completed LLM batches before the full graph is ready."""
+        if not profiles:
+            return
+        self._query(
+            """
+            UNWIND $profiles AS item
+            MERGE (f:ProjectNode:ProjectFile {
+                workspace_id: $workspace_id,
+                node_key: item.node_key
+            })
+            SET f.node_type = 'File',
+                f.name = item.name,
+                f.path = item.path,
+                f.purpose = item.purpose,
+                f.content_hash = item.content_hash,
+                f.properties_json = item.properties_json,
+                f.language = item.language,
+                f.line_count = item.line_count,
+                f.responsibilities = item.responsibilities,
+                f.responsibilities_text = item.responsibilities_text,
+                f.imports = item.imports,
+                f.related_tests = item.related_tests,
+                f.confidence = item.confidence,
+                f.evidence = item.evidence,
+                f.public_symbols_json = item.public_symbols_json,
+                f.profile_version = item.profile_version,
+                f.updated_at = item.updated_at,
+                f.stale = false,
+                f.draft = true
+            """,
+            {
+                "workspace_id": workspace_id,
+                "profiles": [
+                    _profile_node_payload(profile) for profile in profiles
+                ],
+            },
+        )
+
     def sync_snapshot(
         self,
         workspace_id: str,
         workspace_path: str,
-        nodes: List[Dict[str, Any]],
-        edges: List[Dict[str, Any]],
+        records: Sequence[Dict[str, Any]],
+        profiles: Sequence[FileProfile],
+        updated_at: str,
     ) -> None:
-        """Atomically replace this workspace snapshot in Neo4j."""
+        nodes, edges = _graph_payload(records, profiles, workspace_path)
+        session = self.driver.session(database=self.config.neo4j_database)
+        transaction = session.begin_transaction()
 
-        self.driver.verify_connectivity()
-        self.driver.execute_query(
-            """
-            CREATE CONSTRAINT simple_agent_project_node_key IF NOT EXISTS
-            FOR (n:SimpleAgentNode)
-            REQUIRE (n.workspace_id, n.node_key) IS UNIQUE
-            """,
-            database_=self.config.neo4j_database,
-        )
-        self.driver.execute_query(
-            """
-            OPTIONAL MATCH (
-                old:SimpleAgentNode {workspace_id: $workspace_id}
+        def run(query: str, parameters: Dict[str, Any]) -> None:
+            transaction.run(query, **parameters).consume()
+
+        try:
+            run(
+                """
+                MATCH (n:ProjectNode {workspace_id: $workspace_id})
+                DETACH DELETE n
+                """,
+                {"workspace_id": workspace_id},
             )
-            WITH
-                [node IN collect(old) WHERE node IS NOT NULL] AS old_nodes,
-                $nodes AS nodes,
-                $edges AS edges
-            FOREACH (old IN old_nodes | DETACH DELETE old)
-            WITH nodes, edges
-            UNWIND nodes AS item
-            CREATE (n:SimpleAgentNode {
-                workspace_id: $workspace_id,
-                workspace_path: $workspace_path,
-                node_key: item.node_key,
-                node_type: item.node_type,
-                name: item.name,
-                path: item.path,
-                purpose: item.purpose,
-                content_hash: item.content_hash,
-                properties_json: item.properties_json
-            })
-            WITH edges
-            UNWIND edges AS edge
-            MATCH (source:SimpleAgentNode {
-                workspace_id: $workspace_id,
-                node_key: edge.source_key
-            })
-            MATCH (target:SimpleAgentNode {
-                workspace_id: $workspace_id,
-                node_key: edge.target_key
-            })
-            CREATE (source)-[:SIMPLE_AGENT_RELATION {
-                kind: edge.edge_type,
-                evidence_json: edge.evidence_json
-            }]->(target)
+            run(
+                """
+                UNWIND $nodes AS item
+                CREATE (n:ProjectNode {
+                    workspace_id: $workspace_id,
+                    node_key: item.node_key,
+                    node_type: item.node_type,
+                    name: item.name,
+                    path: item.path,
+                    purpose: item.purpose,
+                    content_hash: item.content_hash,
+                    properties_json: item.properties_json
+                })
+                FOREACH (_ IN CASE WHEN item.node_type = 'Workspace'
+                                   THEN [1] ELSE [] END |
+                    SET n:ProjectWorkspace)
+                FOREACH (_ IN CASE WHEN item.node_type = 'File'
+                                   THEN [1] ELSE [] END |
+                    SET n:ProjectFile,
+                        n.language = item.language,
+                        n.line_count = item.line_count,
+                        n.responsibilities = item.responsibilities,
+                        n.responsibilities_text = item.responsibilities_text,
+                        n.imports = item.imports,
+                        n.related_tests = item.related_tests,
+                        n.confidence = item.confidence,
+                        n.evidence = item.evidence,
+                        n.public_symbols_json = item.public_symbols_json,
+                        n.profile_version = item.profile_version,
+                        n.updated_at = item.updated_at,
+                        n.stale = false)
+                FOREACH (_ IN CASE WHEN item.node_type = 'Symbol'
+                                   THEN [1] ELSE [] END |
+                    SET n:ProjectSymbol)
+                FOREACH (_ IN CASE WHEN item.node_type = 'Module'
+                                   THEN [1] ELSE [] END |
+                    SET n:ProjectModule)
+                """,
+                {"workspace_id": workspace_id, "nodes": nodes},
+            )
+            for edge_type in (
+                "CONTAINS",
+                "DEFINES",
+                "IMPORTS",
+                "DEPENDS_ON",
+                "TESTS",
+            ):
+                selected = [
+                    edge for edge in edges if edge["edge_type"] == edge_type
+                ]
+                if not selected:
+                    continue
+                run(
+                    f"""
+                    UNWIND $edges AS edge
+                    MATCH (source:ProjectNode {{
+                        workspace_id: $workspace_id,
+                        node_key: edge.source_key
+                    }})
+                    MATCH (target:ProjectNode {{
+                        workspace_id: $workspace_id,
+                        node_key: edge.target_key
+                    }})
+                    CREATE (source)-[r:{edge_type}]->(target)
+                    SET r.workspace_id = $workspace_id,
+                        r.evidence_json = edge.evidence_json
+                    """,
+                    {"workspace_id": workspace_id, "edges": selected},
+                )
+            run(
+                """
+                MATCH (w:ProjectWorkspace {workspace_id: $workspace_id})
+                SET w.workspace_path = $workspace_path,
+                    w.updated_at = $updated_at,
+                    w.graph_version = $graph_version,
+                    w.last_error = ''
+                """,
+                {
+                    "workspace_id": workspace_id,
+                    "workspace_path": workspace_path,
+                    "updated_at": updated_at,
+                    "graph_version": GRAPH_VERSION,
+                },
+            )
+            transaction.commit()
+        except Exception:
+            transaction.rollback()
+            raise
+        finally:
+            session.close()
+
+    def overview(
+        self,
+        workspace_id: str,
+        max_profiles: int,
+    ) -> Dict[str, Any]:
+        status = self.status(workspace_id)
+        rows = self._query(
+            """
+            MATCH (f:ProjectFile {workspace_id: $workspace_id})
+            RETURN f.path AS path, f.language AS language,
+                   f.purpose AS purpose, f.confidence AS confidence,
+                   f.stale AS stale
+            ORDER BY CASE WHEN f.path STARTS WITH 'src/' THEN 0
+                          WHEN f.path STARTS WITH 'tests/' THEN 2
+                          ELSE 1 END, f.path
+            LIMIT $limit
             """,
-            parameters_={
-                "workspace_id": workspace_id,
-                "workspace_path": workspace_path,
-                "nodes": nodes,
-                "edges": edges,
-            },
-            database_=self.config.neo4j_database,
+            {"workspace_id": workspace_id, "limit": max_profiles},
+        )
+        edge_types = self._query(
+            """
+            MATCH ()-[r]->()
+            WHERE r.workspace_id = $workspace_id
+            RETURN type(r) AS edge_type, count(r) AS count
+            ORDER BY count DESC, edge_type
+            """,
+            {"workspace_id": workspace_id},
+        )
+        return {
+            **status,
+            "edge_types": edge_types,
+            "representative_files": rows,
+        }
+
+    def get_profile(
+        self,
+        workspace_id: str,
+        path: str,
+    ) -> Optional[FileProfile]:
+        rows = self._query(
+            """
+            MATCH (f:ProjectFile {
+                workspace_id: $workspace_id,
+                path: $path
+            })
+            RETURN f
+            LIMIT 1
+            """,
+            {"workspace_id": workspace_id, "path": path},
+        )
+        return (
+            _profile_from_node(_node_dict(rows[0]["f"])) if rows else None
         )
 
+    def mark_profiles_stale(
+        self,
+        workspace_id: str,
+        paths: Sequence[str],
+    ) -> int:
+        rows = self._query(
+            """
+            MATCH (f:ProjectFile {workspace_id: $workspace_id})
+            WHERE f.path IN $paths
+            SET f.stale = true
+            RETURN count(f) AS updated
+            """,
+            {"workspace_id": workspace_id, "paths": list(paths)},
+        )
+        return int(rows[0].get("updated") or 0) if rows else 0
+
+    def search_profiles(
+        self,
+        workspace_id: str,
+        query: str,
+        limit: int,
+    ) -> List[FileProfile]:
+        rows = self._query(
+            """
+            CALL db.index.fulltext.queryNodes(
+                'sa_file_profile_search', $query, {limit: $candidate_limit}
+            )
+            YIELD node, score
+            WHERE node.workspace_id = $workspace_id
+            RETURN node AS f, score
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            {
+                "workspace_id": workspace_id,
+                "query": query,
+                "candidate_limit": max(limit * 4, limit),
+                "limit": limit,
+            },
+        )
+        return [_profile_from_node(_node_dict(row["f"])) for row in rows]
+
+    def neighbors(
+        self,
+        workspace_id: str,
+        path: str,
+        depth: int,
+        limit: int,
+    ) -> Dict[str, Any]:
+        rows = self._query(
+            f"""
+            MATCH (start:ProjectFile {{
+                workspace_id: $workspace_id,
+                path: $path
+            }})
+            MATCH p=(start)-[*0..{depth}]-(related:ProjectNode)
+            WITH DISTINCT related
+            LIMIT $limit
+            RETURN related
+            """,
+            {
+                "workspace_id": workspace_id,
+                "path": path,
+                "limit": limit,
+            },
+        )
+        nodes = [_public_node(_node_dict(row["related"])) for row in rows]
+        keys = [node["node_key"] for node in nodes]
+        edge_rows = (
+            self._query(
+                """
+                MATCH (source:ProjectNode)-[r]->(target:ProjectNode)
+                WHERE source.workspace_id = $workspace_id
+                  AND source.node_key IN $keys
+                  AND target.node_key IN $keys
+                RETURN source.node_key AS source_key,
+                       target.node_key AS target_key,
+                       type(r) AS edge_type,
+                       r.evidence_json AS evidence_json
+                LIMIT $edge_limit
+                """,
+                {
+                    "workspace_id": workspace_id,
+                    "keys": keys,
+                    "edge_limit": limit * 3,
+                },
+            )
+            if keys
+            else []
+        )
+        return {
+            "path": path,
+            "depth": depth,
+            "nodes": nodes,
+            "edges": [_public_edge(row) for row in edge_rows],
+        }
+
+    def _query(
+        self,
+        query: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        result = self.driver.execute_query(
+            query,
+            parameters_=parameters or {},
+            database_=self.config.neo4j_database,
+        )
+        records = result[0] if isinstance(result, tuple) else result.records
+        return [
+            record.data() if hasattr(record, "data") else dict(record)
+            for record in records
+        ]
 
 class ProjectGraph:
-    """Incremental graph derived from the persistent project source index."""
+    """Neo4j-only relationship graph with Chroma profile retrieval."""
 
     def __init__(
         self,
         workspace: Workspace,
         project_index: Optional[ProjectIndex] = None,
         config: Optional[ProjectGraphConfig] = None,
+        profile_generator: Optional[FileProfileGenerator] = None,
+        vector_store: Optional[ChromaVectorStore] = None,
+        store: Optional[Neo4jProjectStore] = None,
     ) -> None:
         self.workspace = workspace
-        self.project_index = project_index or ProjectIndex(workspace)
+        self.vector_store = vector_store or ChromaVectorStore.from_env(workspace)
+        self.project_index = project_index or ProjectIndex(
+            workspace,
+            vector_store=self.vector_store,
+        )
         self.config = config or ProjectGraphConfig.from_env()
-        self.root = workspace.root / ".simple-agent" / "graph"
-        self.database_path = self.root / "project-graph.db"
+        self.profile_generator = profile_generator or LLMFileProfileGenerator()
         self.workspace_id = hashlib.sha256(
             str(workspace.root).encode("utf-8")
         ).hexdigest()[:24]
+        self._store = store
+        self.last_error = ""
 
     def refresh(
         self,
         paths: Optional[Sequence[str]] = None,
     ) -> GraphRefreshResult:
-        """Refresh source index, changed profiles, graph nodes, and relations."""
-
         started = time.monotonic()
         index_result = self.project_index.refresh(paths)
+        if (
+            paths
+            and not index_result.indexed_files
+            and not index_result.deleted_files
+        ):
+            # Edits update the lexical index immediately but defer embeddings
+            # until this requirement-level graph refresh.
+            self.project_index.sync_vector_index()
         refreshed_at = _now()
         records = self._index_records()
-        current_paths = {record["path"] for record in records}
-        updated = 0
-        unchanged = 0
-        deleted = 0
-
-        with self._connect() as connection:
-            existing = {
-                row["path"]: row
-                for row in connection.execute(
-                    """
-                    SELECT path, content_hash, profile_version
-                    FROM file_profiles
-                    """
-                ).fetchall()
-            }
-            stale_paths = sorted(set(existing) - current_paths)
-            for path in stale_paths:
-                connection.execute(
-                    "DELETE FROM file_profiles WHERE path = ?",
-                    (path,),
-                )
-                connection.execute(
-                    "DELETE FROM profile_fts WHERE path = ?",
-                    (path,),
-                )
-                deleted += 1
-
-            related_tests = _related_test_map(records)
-            for record in records:
-                previous = existing.get(record["path"])
+        if not self.config.configured and self._store is None:
+            error = "Neo4j graph requires " + ", ".join(
+                self.config.missing_settings
+            )
+            self.last_error = error
+            return self._refresh_result(
+                records,
+                started,
+                refreshed_at,
+                error=error,
+            )
+        try:
+            store = self._neo4j()
+            store.ensure_schema()
+            graph_status = store.status(self.workspace_id)
+            existing = store.fetch_profiles(self.workspace_id)
+            current_paths = {record["path"] for record in records}
+            changed = [
+                record
+                for record in records
                 if (
-                    previous is not None
-                    and previous["content_hash"] == record["content_hash"]
-                    and previous["profile_version"] == PROFILE_VERSION
-                ):
-                    unchanged += 1
-                    continue
-                profile = _build_profile(
-                    record,
-                    related_tests.get(record["path"], []),
-                    refreshed_at,
+                    record["path"] not in existing
+                    or existing[record["path"]].content_hash
+                    != record["content_hash"]
+                    or existing[record["path"]].profile_version
+                    != PROFILE_VERSION
                 )
-                self._store_profile(connection, profile)
-                updated += 1
-
-            graph_is_empty = (
-                connection.execute(
-                    "SELECT COUNT(*) FROM graph_nodes"
-                ).fetchone()[0]
-                == 0
-            )
-            if updated or deleted or graph_is_empty:
-                self._rebuild_graph(
-                    connection,
-                    records,
-                    related_tests,
-                    refreshed_at,
+            ]
+            stale_unchanged = [
+                record["path"]
+                for record in records
+                if (
+                    record["path"] in existing
+                    and existing[record["path"]].stale
+                    and existing[record["path"]].content_hash
+                    == record["content_hash"]
+                    and existing[record["path"]].profile_version
+                    == PROFILE_VERSION
                 )
-            self._set_metadata(connection, "graph_version", str(GRAPH_VERSION))
-            self._set_metadata(connection, "last_refresh", refreshed_at)
-            self._set_metadata(
-                connection,
-                "last_index_refresh",
-                json.dumps(asdict(index_result), ensure_ascii=False),
+            ]
+            deleted = sorted(set(existing) - current_paths)
+            related_tests = _related_test_map(records)
+            generated = self._generate_and_stage_profiles(
+                store,
+                changed,
+                related_tests,
+                refreshed_at,
             )
-            counts = self._counts(connection)
-
-        neo4j_synced = False
-        graph_status = self.status()
-        needs_neo4j_sync = (
-            self.config.neo4j_configured
-            and (
-                updated
+            profiles = {
+                path: profile
+                for path, profile in existing.items()
+                if path in current_paths and path not in {
+                    record["path"] for record in changed
+                }
+            }
+            profiles.update({profile.path: profile for profile in generated})
+            if (
+                changed
                 or deleted
-                or not graph_status.get("neo4j_last_sync")
-                or bool(graph_status.get("neo4j_last_error"))
-            )
-        )
-        if needs_neo4j_sync:
-            try:
-                self._sync_neo4j()
-                neo4j_synced = True
-                self._record_mirror_status("", refreshed_at)
-            except Exception as exc:
-                self._record_mirror_status(
-                    self._safe_mirror_error(exc),
+                or stale_unchanged
+                or not existing
+                or graph_status.get("graph_version") != GRAPH_VERSION
+            ):
+                store.sync_snapshot(
+                    self.workspace_id,
+                    str(self.workspace.root),
+                    records,
+                    [profiles[path] for path in sorted(profiles)],
                     refreshed_at,
                 )
-        elif self.config.neo4j_configured:
-            neo4j_synced = bool(graph_status.get("neo4j_last_sync"))
-
-        final_status = self.status()
-        return GraphRefreshResult(
-            scanned_files=len(records),
-            updated_profiles=updated,
-            unchanged_profiles=unchanged,
-            deleted_profiles=deleted,
-            nodes=counts["nodes"],
-            edges=counts["edges"],
-            duration_ms=round((time.monotonic() - started) * 1000),
-            backend=final_status["backend"],
-            requested_backend=self.config.backend,
-            fallback_reason=final_status["fallback_reason"],
-            neo4j_synced=neo4j_synced,
-            refreshed_at=refreshed_at,
-        )
+            self._sync_profile_vectors(list(profiles.values()))
+            status = store.status(self.workspace_id)
+            self.last_error = ""
+            return GraphRefreshResult(
+                scanned_files=len(records),
+                updated_profiles=len(changed),
+                unchanged_profiles=len(records) - len(changed),
+                deleted_profiles=len(deleted),
+                nodes=status["nodes"],
+                edges=status["edges"],
+                duration_ms=round((time.monotonic() - started) * 1000),
+                backend="neo4j",
+                neo4j_synced=True,
+                refreshed_at=refreshed_at,
+            )
+        except Exception as exc:
+            error = self._safe_error(exc)
+            self.last_error = error
+            return self._refresh_result(
+                records,
+                started,
+                refreshed_at,
+                error=error,
+            )
 
     def status(self) -> Dict[str, Any]:
-        self._ensure_storage_path()
-        if not self.database_path.exists():
-            backend = self._backend_state({})
+        if not self.config.configured and self._store is None:
+            return self._unavailable_status(
+                "Neo4j graph requires "
+                + ", ".join(self.config.missing_settings)
+            )
+        try:
+            store = self._neo4j()
+            store.ensure_schema()
             return {
-                "ready": False,
-                **backend,
-                "workspace_id": self.workspace_id,
-                "profiles": 0,
-                "nodes": 0,
-                "edges": 0,
+                **store.status(self.workspace_id),
+                "storage": "neo4j-only",
+                "vector": self.vector_store.status(),
+                "last_error": self.last_error,
             }
-        with self._connect() as connection:
-            counts = self._counts(connection)
-            metadata = {
-                row["key"]: row["value"]
-                for row in connection.execute(
-                    "SELECT key, value FROM metadata"
-                ).fetchall()
-            }
-        backend = self._backend_state(metadata)
-        return {
-            "ready": counts["profiles"] > 0,
-            **backend,
-            "workspace_id": self.workspace_id,
-            **counts,
-            "last_refresh": metadata.get("last_refresh", ""),
-            "graph_version": int(metadata.get("graph_version", "0")),
-            "neo4j_last_sync": metadata.get("neo4j_last_sync", ""),
-            "neo4j_last_error": metadata.get("neo4j_last_error", ""),
-        }
+        except Exception as exc:
+            return self._unavailable_status(self._safe_error(exc))
 
-    def _backend_state(self, metadata: Dict[str, str]) -> Dict[str, Any]:
-        requested = self.config.backend
-        if requested == "sqlite":
-            return {
-                "backend": "sqlite",
-                "requested_backend": "sqlite",
-                "fallback_active": False,
-                "fallback_reason": "",
-                "neo4j_configured": False,
-            }
-        missing = self.config.missing_neo4j_settings
-        if missing:
-            return {
-                "backend": "sqlite",
-                "requested_backend": "neo4j",
-                "fallback_active": True,
-                "fallback_reason": (
-                    "Neo4j configuration incomplete: " + ", ".join(missing)
-                ),
-                "neo4j_configured": False,
-            }
-        error = metadata.get("neo4j_last_error", "")
-        if error:
-            return {
-                "backend": "sqlite",
-                "requested_backend": "neo4j",
-                "fallback_active": True,
-                "fallback_reason": error,
-                "neo4j_configured": True,
-            }
-        if metadata.get("neo4j_last_sync"):
-            return {
-                "backend": "neo4j",
-                "requested_backend": "neo4j",
-                "fallback_active": False,
-                "fallback_reason": "",
-                "neo4j_configured": True,
-            }
-        return {
-            "backend": "sqlite",
-            "requested_backend": "neo4j",
-            "fallback_active": True,
-            "fallback_reason": "Neo4j has not completed its first sync",
-            "neo4j_configured": True,
-        }
-
-    def overview(
-        self,
-        max_profiles: int = 30,
-    ) -> Dict[str, Any]:
+    def overview(self, max_profiles: int = 30) -> Dict[str, Any]:
         if not 1 <= max_profiles <= 200:
             raise ValueError("max_profiles must be from 1 to 200")
-        status = self.status()
-        if not status["ready"]:
-            return status
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT path, language, purpose, confidence, stale
-                FROM file_profiles
-                ORDER BY
-                    CASE
-                        WHEN path LIKE 'src/%' THEN 0
-                        WHEN path LIKE 'tests/%' THEN 2
-                        ELSE 1
-                    END,
-                    path
-                LIMIT ?
-                """,
-                (max_profiles,),
-            ).fetchall()
-            edge_types = connection.execute(
-                """
-                SELECT edge_type, COUNT(*) AS count
-                FROM graph_edges
-                GROUP BY edge_type
-                ORDER BY count DESC, edge_type
-                """
-            ).fetchall()
-        return {
-            **status,
-            "edge_types": [dict(row) for row in edge_types],
-            "representative_files": [dict(row) for row in rows],
-        }
+        try:
+            return self._neo4j().overview(self.workspace_id, max_profiles)
+        except Exception as exc:
+            self.last_error = self._safe_error(exc)
+            return self._unavailable_status(self.last_error)
 
     def get_profile(self, path: str) -> Optional[FileProfile]:
-        relative = self._relative_path(path)
-        self._ensure_storage_path()
-        if not self.database_path.exists():
+        try:
+            return self._neo4j().get_profile(
+                self.workspace_id,
+                self._relative_path(path),
+            )
+        except Exception as exc:
+            self.last_error = self._safe_error(exc)
             return None
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM file_profiles WHERE path = ?",
-                (relative,),
-            ).fetchone()
-        return _profile_from_row(row) if row is not None else None
 
     def search_profiles(
         self,
@@ -473,31 +875,43 @@ class ProjectGraph:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("file profile query must be non-empty")
         if not 1 <= limit <= MAX_PROFILE_RESULTS:
-            raise ValueError(
-                f"profile search limit must be from 1 to {MAX_PROFILE_RESULTS}"
+            raise ValueError("profile search limit must be from 1 to 30")
+        try:
+            lexical_query = _lucene_query(query)
+            keyword = self._neo4j().search_profiles(
+                self.workspace_id,
+                lexical_query,
+                min(MAX_PROFILE_RESULTS, limit * 3),
+            ) if lexical_query else []
+        except Exception as exc:
+            self.last_error = self._safe_error(exc)
+            keyword = []
+        try:
+            vectors = self.vector_store.query(
+                "file_profiles",
+                query,
+                min(MAX_PROFILE_RESULTS, limit * 3),
             )
-        self._ensure_storage_path()
-        if not self.database_path.exists():
-            return []
-        terms = _query_terms(query)[:64]
-        if not terms:
-            return []
-        expression = " OR ".join(
-            f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms
-        )
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT p.*
-                FROM profile_fts
-                JOIN file_profiles p ON p.path = profile_fts.path
-                WHERE profile_fts MATCH ?
-                ORDER BY bm25(profile_fts), p.path
-                LIMIT ?
-                """,
-                (expression, limit),
-            ).fetchall()
-        return [_profile_from_row(row) for row in rows]
+        except Exception:
+            vectors = []
+        keyword_ids = [profile.path for profile in keyword]
+        vector_ids = [
+            str(hit.metadata.get("path", "")) for hit in vectors
+        ]
+        scores = reciprocal_rank_fusion([keyword_ids, vector_ids])
+        candidates = {profile.path: profile for profile in keyword}
+        for path in vector_ids:
+            if path and path not in candidates:
+                profile = self.get_profile(path)
+                if profile is not None:
+                    candidates[path] = profile
+        return [
+            profile
+            for _, profile in sorted(
+                candidates.items(),
+                key=lambda item: (-scores.get(item[0], 0.0), item[0]),
+            )[:limit]
+        ]
 
     def neighbors(
         self,
@@ -505,50 +919,27 @@ class ProjectGraph:
         depth: int = 1,
         limit: int = 100,
     ) -> Dict[str, Any]:
-        relative = self._relative_path(path)
         if not 1 <= depth <= 4:
             raise ValueError("graph depth must be from 1 to 4")
         if not 1 <= limit <= 500:
             raise ValueError("graph result limit must be from 1 to 500")
-        start = f"file:{relative}"
-        self._ensure_storage_path()
-        if not self.database_path.exists():
-            return {"path": relative, "nodes": [], "edges": []}
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                WITH RECURSIVE reachable(node_key, depth) AS (
-                    SELECT ?, 0
-                    UNION
-                    SELECT
-                        CASE
-                            WHEN e.source_key = reachable.node_key
-                            THEN e.target_key
-                            ELSE e.source_key
-                        END,
-                        reachable.depth + 1
-                    FROM reachable
-                    JOIN graph_edges e
-                      ON e.source_key = reachable.node_key
-                      OR e.target_key = reachable.node_key
-                    WHERE reachable.depth < ?
-                )
-                SELECT DISTINCT n.*
-                FROM reachable
-                JOIN graph_nodes n ON n.node_key = reachable.node_key
-                ORDER BY reachable.depth, n.node_type, n.node_key
-                LIMIT ?
-                """,
-                (start, depth, limit),
-            ).fetchall()
-            node_keys = [row["node_key"] for row in rows]
-            edges = self._edges_for_keys(connection, node_keys, limit * 3)
-        return {
-            "path": relative,
-            "depth": depth,
-            "nodes": [_node_to_dict(row) for row in rows],
-            "edges": edges,
-        }
+        relative = self._relative_path(path)
+        try:
+            return self._neo4j().neighbors(
+                self.workspace_id,
+                relative,
+                depth,
+                limit,
+            )
+        except Exception as exc:
+            self.last_error = self._safe_error(exc)
+            return {
+                "path": relative,
+                "depth": depth,
+                "nodes": [],
+                "edges": [],
+                "error": self.last_error,
+            }
 
     def impact_analysis(
         self,
@@ -558,468 +949,163 @@ class ProjectGraph:
     ) -> Dict[str, Any]:
         graph = self.neighbors(path, depth, limit)
         relative = graph["path"]
-        affected_files = []
-        related_tests = []
-        for node in graph["nodes"]:
-            node_path = node.get("path")
-            if (
-                node["node_type"] == "File"
-                and node_path
-                and node_path != relative
-            ):
-                if _is_test_path(node_path):
-                    related_tests.append(node_path)
-                else:
-                    affected_files.append(node_path)
-        incoming = [
-            edge
-            for edge in graph["edges"]
-            if edge["target_key"] == f"file:{relative}"
+        files = [
+            node["path"]
+            for node in graph["nodes"]
+            if node["node_type"] == "File"
+            and node.get("path")
+            and node["path"] != relative
         ]
         return {
             "target": relative,
-            "profile": (
-                profile_to_dict(self.get_profile(relative))
-                if self.get_profile(relative)
-                else None
+            "profile": profile_to_dict(self.get_profile(relative)),
+            "affected_files": sorted(
+                set(path for path in files if not _is_test_path(path))
             ),
-            "direct_incoming_relations": incoming,
-            "affected_files": sorted(set(affected_files)),
-            "related_tests": sorted(set(related_tests)),
+            "related_tests": sorted(
+                set(path for path in files if _is_test_path(path))
+            ),
             "graph": graph,
         }
 
     def mark_stale(self, paths: Sequence[str]) -> int:
-        relative_paths = [self._relative_path(path) for path in paths]
-        self._ensure_storage_path()
-        if not relative_paths or not self.database_path.exists():
+        relative_paths = [
+            self._relative_path(path) for path in paths if path
+        ]
+        if not relative_paths:
             return 0
-        with self._connect() as connection:
-            placeholders = ",".join("?" for _ in relative_paths)
-            cursor = connection.execute(
-                f"""
-                UPDATE file_profiles SET stale = 1
-                WHERE path IN ({placeholders})
-                """,
-                tuple(relative_paths),
+        if not self.config.configured and self._store is None:
+            return 0
+        try:
+            return self._neo4j().mark_profiles_stale(
+                self.workspace_id,
+                relative_paths,
             )
-            return cursor.rowcount
+        except Exception as exc:
+            self.last_error = self._safe_error(exc)
+            return 0
+
+    def record_source_change(self, path: str) -> None:
+        """Update deterministic evidence now and defer LLM profile refresh."""
+        relative = self._relative_path(path)
+        self.project_index.refresh([relative], sync_vectors=False)
+        self.mark_stale([relative])
+
+    def _generate_and_stage_profiles(
+        self,
+        store: Neo4jProjectStore,
+        records: Sequence[Dict[str, Any]],
+        related_tests: Dict[str, List[str]],
+        generated_at: str,
+    ) -> List[FileProfile]:
+        if not records:
+            return []
+        if isinstance(self.profile_generator, LLMFileProfileGenerator):
+            self.profile_generator._ensure_model()
+        batches = [
+            list(records[offset : offset + PROFILE_BATCH_SIZE])
+            for offset in range(0, len(records), PROFILE_BATCH_SIZE)
+        ]
+        generated: List[FileProfile] = []
+        failures: List[Exception] = []
+        with ThreadPoolExecutor(
+            max_workers=min(PROFILE_MAX_CONCURRENCY, len(batches)),
+            thread_name_prefix="profile-stage",
+        ) as executor:
+            futures: Dict[Future[List[FileProfile]], List[Dict[str, Any]]] = {
+                executor.submit(
+                    self.profile_generator.generate,
+                    batch,
+                    related_tests,
+                    generated_at,
+                ): batch
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                try:
+                    profiles = future.result()
+                    store.stage_profiles(self.workspace_id, profiles)
+                    generated.extend(profiles)
+                except Exception as exc:
+                    failures.append(exc)
+        if failures:
+            raise failures[0]
+        return sorted(generated, key=lambda profile: profile.path)
+
+    def _neo4j(self) -> Neo4jProjectStore:
+        if self._store is None:
+            self._store = Neo4jProjectStore(self.config)
+        return self._store
 
     def _index_records(self) -> List[Dict[str, Any]]:
-        if not self.project_index.database_path.exists():
-            return []
-        connection = sqlite3.connect(self.project_index.database_path)
-        connection.row_factory = sqlite3.Row
-        try:
-            files = connection.execute(
-                """
-                SELECT path, content_hash, language, line_count
-                FROM files
-                WHERE indexed = 1
-                ORDER BY path
-                """
-            ).fetchall()
-            records = []
-            for file_row in files:
-                path = file_row["path"]
-                symbols = [
-                    dict(row)
-                    for row in connection.execute(
-                        """
-                        SELECT name, kind, line, signature
-                        FROM symbols
-                        WHERE path = ?
-                        ORDER BY line, name
-                        """,
-                        (path,),
-                    ).fetchall()
-                ]
-                imports = [
-                    dict(row)
-                    for row in connection.execute(
-                        """
-                        SELECT target, line, kind
-                        FROM imports
-                        WHERE path = ?
-                        ORDER BY line, target
-                        """,
-                        (path,),
-                    ).fetchall()
-                ]
-                chunk = connection.execute(
-                    """
-                    SELECT content
-                    FROM chunks
-                    WHERE path = ?
-                    ORDER BY chunk_index
-                    LIMIT 1
-                    """,
-                    (path,),
-                ).fetchone()
-                records.append(
-                    {
-                        **dict(file_row),
-                        "symbols": symbols,
-                        "imports": imports,
-                        "leading_content": chunk["content"] if chunk else "",
-                    }
-                )
-            return records
-        finally:
-            connection.close()
+        return self.project_index.file_evidence_records()
 
-    def _store_profile(
-        self,
-        connection: sqlite3.Connection,
-        profile: FileProfile,
-    ) -> None:
-        connection.execute(
-            """
-            INSERT INTO file_profiles (
-                path, content_hash, language, line_count, purpose,
-                responsibilities_json, public_symbols_json, imports_json,
-                related_tests_json, confidence, evidence_json, stale,
-                profile_version, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                content_hash = excluded.content_hash,
-                language = excluded.language,
-                line_count = excluded.line_count,
-                purpose = excluded.purpose,
-                responsibilities_json = excluded.responsibilities_json,
-                public_symbols_json = excluded.public_symbols_json,
-                imports_json = excluded.imports_json,
-                related_tests_json = excluded.related_tests_json,
-                confidence = excluded.confidence,
-                evidence_json = excluded.evidence_json,
-                stale = excluded.stale,
-                profile_version = excluded.profile_version,
-                updated_at = excluded.updated_at
-            """,
-            (
-                profile.path,
-                profile.content_hash,
-                profile.language,
-                profile.line_count,
-                profile.purpose,
-                json.dumps(profile.responsibilities, ensure_ascii=False),
-                json.dumps(profile.public_symbols, ensure_ascii=False),
-                json.dumps(profile.imports, ensure_ascii=False),
-                json.dumps(profile.related_tests, ensure_ascii=False),
-                profile.confidence,
-                json.dumps(profile.evidence, ensure_ascii=False),
-                int(profile.stale),
-                profile.profile_version,
-                profile.updated_at,
-            ),
-        )
-        connection.execute(
-            "DELETE FROM profile_fts WHERE path = ?",
-            (profile.path,),
-        )
-        terms = " ".join(
-            sorted(
-                _index_terms(
-                    " ".join(
+    def _sync_profile_vectors(self, profiles: List[FileProfile]) -> None:
+        self.vector_store.sync_namespace(
+            "file_profiles",
+            [
+                VectorRecord(
+                    id=content_fingerprint("profile", profile.path),
+                    text="\n".join(
                         [
                             profile.path,
                             profile.purpose,
                             *profile.responsibilities,
                             *[
-                                symbol["name"]
+                                symbol.get("name", "")
                                 for symbol in profile.public_symbols
                             ],
-                            *profile.imports,
                         ]
-                    )
+                    ),
+                    content_hash=content_fingerprint(
+                        profile.content_hash,
+                        str(profile.profile_version),
+                        profile.purpose,
+                        *profile.responsibilities,
+                    ),
+                    metadata={"path": profile.path},
                 )
-            )
-        )
-        connection.execute(
-            """
-            INSERT INTO profile_fts (
-                path, purpose, responsibilities, symbols, terms
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                profile.path,
-                profile.purpose,
-                "\n".join(profile.responsibilities),
-                " ".join(
-                    symbol["name"] for symbol in profile.public_symbols
-                ),
-                terms,
-            ),
+                for profile in profiles
+            ],
         )
 
-    def _rebuild_graph(
+    def _refresh_result(
         self,
-        connection: sqlite3.Connection,
-        records: List[Dict[str, Any]],
-        related_tests: Dict[str, List[str]],
+        records: Sequence[Dict[str, Any]],
+        started: float,
         refreshed_at: str,
-    ) -> None:
-        connection.execute("DELETE FROM graph_edges")
-        connection.execute("DELETE FROM graph_nodes")
-        workspace_key = "workspace:."
-        self._insert_node(
-            connection,
-            workspace_key,
-            "Workspace",
-            self.workspace.root.name,
-            "",
-            "",
-            "",
-            {"root": str(self.workspace.root)},
-            refreshed_at,
-        )
-        aliases = _module_aliases(records)
-        module_targets: Set[str] = set()
-        for record in records:
-            path = record["path"]
-            profile_row = connection.execute(
-                "SELECT purpose FROM file_profiles WHERE path = ?",
-                (path,),
-            ).fetchone()
-            purpose = profile_row["purpose"] if profile_row else ""
-            file_key = f"file:{path}"
-            self._insert_node(
-                connection,
-                file_key,
-                "File",
-                Path(path).name,
-                path,
-                purpose,
-                record["content_hash"],
-                {
-                    "language": record["language"],
-                    "line_count": record["line_count"],
-                    "is_test": _is_test_path(path),
-                },
-                refreshed_at,
-            )
-            self._insert_edge(
-                connection,
-                workspace_key,
-                file_key,
-                "CONTAINS",
-                {"path": path},
-                refreshed_at,
-            )
-            for symbol in record["symbols"]:
-                symbol_key = (
-                    f"symbol:{path}:{symbol['name']}:{symbol['line']}"
-                )
-                self._insert_node(
-                    connection,
-                    symbol_key,
-                    "Symbol",
-                    symbol["name"],
-                    path,
-                    symbol["signature"],
-                    record["content_hash"],
-                    {
-                        "kind": symbol["kind"],
-                        "line": symbol["line"],
-                    },
-                    refreshed_at,
-                )
-                self._insert_edge(
-                    connection,
-                    file_key,
-                    symbol_key,
-                    "DEFINES",
-                    {"line": symbol["line"]},
-                    refreshed_at,
-                )
-            for imported in record["imports"]:
-                target = imported["target"]
-                module_key = f"module:{target}"
-                module_targets.add(target)
-                resolved = _resolve_import(path, target, aliases)
-                self._insert_edge(
-                    connection,
-                    file_key,
-                    module_key,
-                    "IMPORTS",
-                    {
-                        "line": imported["line"],
-                        "kind": imported["kind"],
-                    },
-                    refreshed_at,
-                )
-                if resolved:
-                    self._insert_edge(
-                        connection,
-                        file_key,
-                        f"file:{resolved}",
-                        "DEPENDS_ON",
-                        {
-                            "line": imported["line"],
-                            "target": target,
-                        },
-                        refreshed_at,
-                    )
-            for test_path in related_tests.get(path, []):
-                self._insert_edge(
-                    connection,
-                    f"file:{test_path}",
-                    file_key,
-                    "TESTS",
-                    {"inferred": True},
-                    refreshed_at,
-                )
-        for target in sorted(module_targets):
-            self._insert_node(
-                connection,
-                f"module:{target}",
-                "Module",
-                target,
-                "",
-                "",
-                "",
-                {"import_target": target},
-                refreshed_at,
-            )
-        counts = self._counts(connection)
-        if counts["nodes"] > MAX_GRAPH_NODES:
-            raise ValueError("project graph exceeds node safety limit")
-        if counts["edges"] > MAX_GRAPH_EDGES:
-            raise ValueError("project graph exceeds edge safety limit")
-
-    @staticmethod
-    def _insert_node(
-        connection: sqlite3.Connection,
-        node_key: str,
-        node_type: str,
-        name: str,
-        path: str,
-        purpose: str,
-        content_hash: str,
-        properties: Dict[str, Any],
-        updated_at: str,
-    ) -> None:
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO graph_nodes (
-                node_key, node_type, name, path, purpose, content_hash,
-                properties_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                node_key,
-                node_type,
-                name,
-                path,
-                purpose,
-                content_hash,
-                json.dumps(properties, ensure_ascii=False),
-                updated_at,
-            ),
+        error: str,
+    ) -> GraphRefreshResult:
+        return GraphRefreshResult(
+            scanned_files=len(records),
+            updated_profiles=0,
+            unchanged_profiles=0,
+            deleted_profiles=0,
+            nodes=0,
+            edges=0,
+            duration_ms=round((time.monotonic() - started) * 1000),
+            backend="neo4j",
+            neo4j_synced=False,
+            refreshed_at=refreshed_at,
+            error=error,
         )
 
-    @staticmethod
-    def _insert_edge(
-        connection: sqlite3.Connection,
-        source_key: str,
-        target_key: str,
-        edge_type: str,
-        evidence: Dict[str, Any],
-        updated_at: str,
-    ) -> None:
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO graph_edges (
-                source_key, target_key, edge_type, evidence_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                source_key,
-                target_key,
-                edge_type,
-                json.dumps(evidence, ensure_ascii=False),
-                updated_at,
-            ),
-        )
+    def _unavailable_status(self, error: str) -> Dict[str, Any]:
+        return {
+            "ready": False,
+            "backend": "neo4j",
+            "storage": "neo4j-only",
+            "workspace_id": self.workspace_id,
+            "profiles": 0,
+            "nodes": 0,
+            "edges": 0,
+            "last_refresh": "",
+            "graph_version": GRAPH_VERSION,
+            "last_error": error,
+            "vector": self.vector_store.status(),
+        }
 
-    def _edges_for_keys(
-        self,
-        connection: sqlite3.Connection,
-        node_keys: Sequence[str],
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        if not node_keys:
-            return []
-        placeholders = ",".join("?" for _ in node_keys)
-        rows = connection.execute(
-            f"""
-            SELECT source_key, target_key, edge_type, evidence_json
-            FROM graph_edges
-            WHERE source_key IN ({placeholders})
-              AND target_key IN ({placeholders})
-            ORDER BY edge_type, source_key, target_key
-            LIMIT ?
-            """,
-            (*node_keys, *node_keys, limit),
-        ).fetchall()
-        return [
-            {
-                "source_key": row["source_key"],
-                "target_key": row["target_key"],
-                "edge_type": row["edge_type"],
-                "evidence": json.loads(row["evidence_json"]),
-            }
-            for row in rows
-        ]
-
-    def _sync_neo4j(self) -> None:
-        with self._connect() as connection:
-            nodes = [
-                {
-                    **dict(row),
-                    "properties_json": row["properties_json"],
-                }
-                for row in connection.execute(
-                    """
-                    SELECT node_key, node_type, name, path, purpose,
-                           content_hash, properties_json
-                    FROM graph_nodes
-                    ORDER BY node_key
-                    """
-                ).fetchall()
-            ]
-            edges = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT source_key, target_key, edge_type, evidence_json
-                    FROM graph_edges
-                    ORDER BY source_key, target_key, edge_type
-                    """
-                ).fetchall()
-            ]
-        mirror = Neo4jGraphMirror(self.config)
-        try:
-            mirror.sync_snapshot(
-                self.workspace_id,
-                str(self.workspace.root),
-                nodes,
-                edges,
-            )
-        finally:
-            mirror.close()
-
-    def _record_mirror_status(self, error: str, refreshed_at: str) -> None:
-        with self._connect() as connection:
-            self._set_metadata(connection, "neo4j_last_error", error)
-            if not error:
-                self._set_metadata(
-                    connection,
-                    "neo4j_last_sync",
-                    refreshed_at,
-                )
-
-    def _safe_mirror_error(self, error: Exception) -> str:
+    def _safe_error(self, error: Exception) -> str:
         message = f"{type(error).__name__}: {error}"
         if self.config.neo4j_password:
             message = message.replace(
@@ -1028,334 +1114,297 @@ class ProjectGraph:
             )
         return message[:2_000]
 
-    @staticmethod
-    def _set_metadata(
-        connection: sqlite3.Connection,
-        key: str,
-        value: str,
-    ) -> None:
-        connection.execute(
-            """
-            INSERT INTO metadata (key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (key, value),
-        )
-
-    @staticmethod
-    def _counts(connection: sqlite3.Connection) -> Dict[str, int]:
-        return {
-            "profiles": connection.execute(
-                "SELECT COUNT(*) FROM file_profiles"
-            ).fetchone()[0],
-            "stale_profiles": connection.execute(
-                "SELECT COUNT(*) FROM file_profiles WHERE stale = 1"
-            ).fetchone()[0],
-            "nodes": connection.execute(
-                "SELECT COUNT(*) FROM graph_nodes"
-            ).fetchone()[0],
-            "edges": connection.execute(
-                "SELECT COUNT(*) FROM graph_edges"
-            ).fetchone()[0],
-        }
-
     def _relative_path(self, path: str) -> str:
         resolved = self.workspace.resolve(path)
         return resolved.relative_to(self.workspace.root).as_posix()
 
-    def _connect(self) -> sqlite3.Connection:
-        self._ensure_storage_path()
-        self.root.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS file_profiles (
-                path TEXT PRIMARY KEY,
-                content_hash TEXT NOT NULL,
-                language TEXT NOT NULL,
-                line_count INTEGER NOT NULL,
-                purpose TEXT NOT NULL,
-                responsibilities_json TEXT NOT NULL,
-                public_symbols_json TEXT NOT NULL,
-                imports_json TEXT NOT NULL,
-                related_tests_json TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                evidence_json TEXT NOT NULL,
-                stale INTEGER NOT NULL,
-                profile_version INTEGER NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE VIRTUAL TABLE IF NOT EXISTS profile_fts USING fts5(
-                path UNINDEXED,
-                purpose,
-                responsibilities,
-                symbols,
-                terms,
-                tokenize = 'unicode61'
-            );
-            CREATE TABLE IF NOT EXISTS graph_nodes (
-                node_key TEXT PRIMARY KEY,
-                node_type TEXT NOT NULL,
-                name TEXT NOT NULL,
-                path TEXT NOT NULL,
-                purpose TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                properties_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS graph_nodes_path_idx
-            ON graph_nodes(path);
-            CREATE INDEX IF NOT EXISTS graph_nodes_type_idx
-            ON graph_nodes(node_type);
-            CREATE TABLE IF NOT EXISTS graph_edges (
-                source_key TEXT NOT NULL,
-                target_key TEXT NOT NULL,
-                edge_type TEXT NOT NULL,
-                evidence_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (source_key, target_key, edge_type)
-            );
-            CREATE INDEX IF NOT EXISTS graph_edges_source_idx
-            ON graph_edges(source_key);
-            CREATE INDEX IF NOT EXISTS graph_edges_target_idx
-            ON graph_edges(target_key);
-            CREATE INDEX IF NOT EXISTS graph_edges_type_idx
-            ON graph_edges(edge_type);
-            """
-        )
-        return connection
-
-    def _ensure_storage_path(self) -> None:
-        paths = [
-            self.workspace.root / ".simple-agent",
-            self.root,
-            self.database_path,
-        ]
-        if any(path.is_symlink() for path in paths if path.exists()):
-            raise ValueError("project graph paths cannot contain symbolic links")
-        try:
-            self.database_path.resolve(strict=False).relative_to(
-                self.workspace.root
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "project graph path is outside the workspace"
-            ) from exc
-
 
 def profile_to_dict(profile: Optional[FileProfile]) -> Optional[Dict[str, Any]]:
-    if profile is None:
-        return None
-    return {"citation": profile.citation, **asdict(profile)}
-
-
-def _profile_from_row(row: sqlite3.Row) -> FileProfile:
-    return FileProfile(
-        path=row["path"],
-        content_hash=row["content_hash"],
-        language=row["language"],
-        line_count=row["line_count"],
-        purpose=row["purpose"],
-        responsibilities=json.loads(row["responsibilities_json"]),
-        public_symbols=json.loads(row["public_symbols_json"]),
-        imports=json.loads(row["imports_json"]),
-        related_tests=json.loads(row["related_tests_json"]),
-        confidence=float(row["confidence"]),
-        evidence=json.loads(row["evidence_json"]),
-        stale=bool(row["stale"]),
-        profile_version=row["profile_version"],
-        updated_at=row["updated_at"],
+    return (
+        {"citation": profile.citation, **asdict(profile)}
+        if profile is not None
+        else None
     )
 
 
-def _node_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+def _profile_node_payload(profile: FileProfile) -> Dict[str, Any]:
     return {
-        "node_key": row["node_key"],
-        "node_type": row["node_type"],
-        "name": row["name"],
-        "path": row["path"],
-        "purpose": row["purpose"],
-        "properties": json.loads(row["properties_json"]),
+        "node_key": f"file:{profile.path}",
+        "name": Path(profile.path).name,
+        "path": profile.path,
+        "purpose": profile.purpose,
+        "content_hash": profile.content_hash,
+        "properties_json": json.dumps(
+            {"is_test": _is_test_path(profile.path)},
+            ensure_ascii=False,
+        ),
+        "language": profile.language,
+        "line_count": profile.line_count,
+        "responsibilities": profile.responsibilities,
+        "responsibilities_text": "\n".join(profile.responsibilities),
+        "imports": profile.imports,
+        "related_tests": profile.related_tests,
+        "confidence": profile.confidence,
+        "evidence": profile.evidence,
+        "public_symbols_json": json.dumps(
+            profile.public_symbols,
+            ensure_ascii=False,
+        ),
+        "profile_version": profile.profile_version,
+        "updated_at": profile.updated_at,
     }
 
 
-def _build_profile(
-    record: Dict[str, Any],
-    related_tests: List[str],
-    refreshed_at: str,
-) -> FileProfile:
-    path = record["path"]
-    symbols = record["symbols"][:100]
-    imports = list(
-        dict.fromkeys(item["target"] for item in record["imports"])
-    )[:100]
-    leading = record["leading_content"]
-    purpose, confidence = _infer_purpose(path, leading, symbols)
-    responsibilities = _responsibilities(path, symbols, imports)
-    evidence = [
-        f"{path}#L{symbol['line']}"
-        for symbol in symbols[:20]
+def _graph_payload(
+    records: Sequence[Dict[str, Any]],
+    profiles: Sequence[FileProfile],
+    workspace_path: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    by_path = {profile.path: profile for profile in profiles}
+    aliases = _module_aliases(records)
+    nodes = [
+        {
+            "node_key": "workspace:.",
+            "node_type": "Workspace",
+            "name": Path(workspace_path).name,
+            "path": "",
+            "purpose": "",
+            "content_hash": "",
+            "properties_json": json.dumps(
+                {"workspace_path": workspace_path},
+                ensure_ascii=False,
+            ),
+            **_empty_profile_properties(),
+        }
     ]
-    if not evidence:
-        evidence = [f"{path}#L1"]
+    edges: List[Dict[str, Any]] = []
+    modules: Set[str] = set()
+    related_tests = _related_test_map(records)
+    for record in records:
+        path = record["path"]
+        profile = by_path[path]
+        file_key = f"file:{path}"
+        nodes.append(
+            {
+                "node_type": "File",
+                **_profile_node_payload(profile),
+            }
+        )
+        edges.append(_edge("workspace:.", file_key, "CONTAINS", {"path": path}))
+        for symbol in record["symbols"]:
+            symbol_key = f"symbol:{path}:{symbol['name']}:{symbol['line']}"
+            nodes.append(
+                {
+                    "node_key": symbol_key,
+                    "node_type": "Symbol",
+                    "name": symbol["name"],
+                    "path": path,
+                    "purpose": symbol["signature"],
+                    "content_hash": record["content_hash"],
+                    "properties_json": json.dumps(
+                        {
+                            "kind": symbol["kind"],
+                            "line": symbol["line"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    **_empty_profile_properties(),
+                }
+            )
+            edges.append(
+                _edge(
+                    file_key,
+                    symbol_key,
+                    "DEFINES",
+                    {"line": symbol["line"]},
+                )
+            )
+        for imported in record["imports"]:
+            target = imported["target"]
+            modules.add(target)
+            edges.append(
+                _edge(
+                    file_key,
+                    f"module:{target}",
+                    "IMPORTS",
+                    {"line": imported["line"]},
+                )
+            )
+            resolved = _resolve_import(path, target, aliases)
+            if resolved:
+                edges.append(
+                    _edge(
+                        file_key,
+                        f"file:{resolved}",
+                        "DEPENDS_ON",
+                        {"target": target, "line": imported["line"]},
+                    )
+                )
+        for test_path in related_tests.get(path, []):
+            edges.append(
+                _edge(
+                    f"file:{test_path}",
+                    file_key,
+                    "TESTS",
+                    {"inferred": True},
+                )
+            )
+    for target in sorted(modules):
+        nodes.append(
+            {
+                "node_key": f"module:{target}",
+                "node_type": "Module",
+                "name": target,
+                "path": "",
+                "purpose": "",
+                "content_hash": "",
+                "properties_json": json.dumps(
+                    {"import_target": target},
+                    ensure_ascii=False,
+                ),
+                **_empty_profile_properties(),
+            }
+        )
+    return nodes, edges
+
+
+def _empty_profile_properties() -> Dict[str, Any]:
+    return {
+        "language": "",
+        "line_count": 0,
+        "responsibilities": [],
+        "responsibilities_text": "",
+        "imports": [],
+        "related_tests": [],
+        "confidence": 0.0,
+        "evidence": [],
+        "public_symbols_json": "[]",
+        "profile_version": 0,
+        "updated_at": "",
+    }
+
+
+def _edge(
+    source: str,
+    target: str,
+    kind: str,
+    evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "source_key": source,
+        "target_key": target,
+        "edge_type": kind,
+        "evidence_json": json.dumps(evidence, ensure_ascii=False),
+    }
+
+
+def _profile_from_node(node: Dict[str, Any]) -> FileProfile:
     return FileProfile(
-        path=path,
-        content_hash=record["content_hash"],
-        language=record["language"],
-        line_count=record["line_count"],
-        purpose=purpose,
-        responsibilities=responsibilities,
-        public_symbols=symbols[:50],
-        imports=imports,
-        related_tests=related_tests,
-        confidence=confidence,
-        evidence=evidence,
-        stale=False,
-        profile_version=PROFILE_VERSION,
-        updated_at=refreshed_at,
+        path=str(node.get("path", "")),
+        content_hash=str(node.get("content_hash", "")),
+        language=str(node.get("language", "")),
+        line_count=int(node.get("line_count", 0)),
+        purpose=str(node.get("purpose", "")),
+        responsibilities=list(node.get("responsibilities") or []),
+        public_symbols=json.loads(node.get("public_symbols_json") or "[]"),
+        imports=list(node.get("imports") or []),
+        related_tests=list(node.get("related_tests") or []),
+        confidence=float(node.get("confidence", 0.0)),
+        evidence=list(node.get("evidence") or []),
+        stale=bool(node.get("stale", False)),
+        profile_version=int(node.get("profile_version", 0)),
+        updated_at=str(node.get("updated_at", "")),
     )
 
 
-def _infer_purpose(
-    path: str,
-    leading: str,
-    symbols: List[Dict[str, Any]],
-) -> Tuple[str, float]:
-    file_path = Path(path)
-    if _is_test_path(path):
-        target = file_path.stem.removeprefix("test_").replace("_", " ")
-        return f"验证 {target or file_path.name} 相关行为和边界条件。", 0.9
-    doc = _leading_description(leading, file_path.suffix.lower())
-    if doc:
-        return doc[:500], 0.92
-    names = [symbol["name"] for symbol in symbols[:8]]
-    if file_path.name == "__init__.py":
-        return "定义包入口并组织或导出该包的公共能力。", 0.75
-    if file_path.name in {"cli.py", "main.py", "__main__.py"}:
-        return "提供程序入口、参数处理和顶层运行流程。", 0.85
-    if file_path.suffix.lower() in {".md", ".rst"}:
-        return f"记录 {file_path.stem} 相关项目文档。", 0.72
-    if names:
-        return (
-            f"实现 {file_path.stem} 模块，主要定义 "
-            + "、".join(names)
-            + "。"
-        ), 0.78
-    if file_path.suffix.lower() in {
-        ".json",
-        ".toml",
-        ".yaml",
-        ".yml",
-        ".ini",
-        ".cfg",
-    }:
-        return f"保存 {file_path.stem} 相关配置或结构化数据。", 0.7
-    return f"实现或描述 {file_path.stem} 相关项目能力。", 0.55
+def _node_dict(node: Any) -> Dict[str, Any]:
+    return dict(node.items()) if hasattr(node, "items") else dict(node)
 
 
-def _leading_description(text: str, suffix: str) -> str:
-    if suffix == ".py":
-        match = re.match(
-            r'\s*(?:[rubfRUBF]{0,2})?("""|\'\'\')(.+?)\1',
-            text,
-            re.DOTALL,
-        )
-        if match:
-            return " ".join(match.group(2).strip().split())
-    if suffix in {".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs"}:
-        match = re.match(r"\s*/\*+\s*(.+?)\*/", text, re.DOTALL)
-        if match:
-            return " ".join(match.group(1).replace("*", " ").split())
-        match = re.match(r"\s*//\s*(.+)", text)
-        if match:
-            return match.group(1).strip()
-    if suffix in {".md", ".mdx", ".rst"}:
-        for line in text.splitlines():
-            clean = line.strip().lstrip("#").strip()
-            if clean:
-                return f"记录 {clean} 相关项目说明。"
-    return ""
+def _public_node(node: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "node_key": node.get("node_key", ""),
+        "node_type": node.get("node_type", ""),
+        "name": node.get("name", ""),
+        "path": node.get("path", ""),
+        "purpose": node.get("purpose", ""),
+        "properties": json.loads(node.get("properties_json") or "{}"),
+    }
 
 
-def _responsibilities(
-    path: str,
-    symbols: List[Dict[str, Any]],
-    imports: List[str],
-) -> List[str]:
-    responsibilities = []
-    classes = [
-        symbol["name"]
-        for symbol in symbols
-        if symbol["kind"] in {"class", "interface", "struct", "trait"}
-    ]
-    functions = [
-        symbol["name"]
-        for symbol in symbols
-        if symbol["kind"] == "function"
-    ]
-    if classes:
-        responsibilities.append(
-            "定义核心类型：" + "、".join(classes[:12])
-        )
-    if functions:
-        responsibilities.append(
-            "提供主要函数：" + "、".join(functions[:15])
-        )
-    if imports:
-        responsibilities.append(
-            "集成依赖：" + "、".join(imports[:12])
-        )
-    if _is_test_path(path):
-        responsibilities.append("提供自动化验证和回归保护")
-    if not responsibilities:
-        responsibilities.append("承载该文件路径所对应的项目实现或配置")
-    return responsibilities[:10]
+def _public_edge(edge: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source_key": edge.get("source_key", ""),
+        "target_key": edge.get("target_key", ""),
+        "edge_type": edge.get("edge_type", ""),
+        "evidence": json.loads(edge.get("evidence_json") or "{}"),
+    }
+
+
+def _string_list(value: Any, limit: int) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        str(item).strip()[:500]
+        for item in value
+        if str(item).strip()
+    ][:limit]
+
+
+def _confidence(value: Any) -> float:
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.7
+
+
+def _strip_json_fence(content: str) -> str:
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text
+
+
+def _lucene_query(text: str) -> str:
+    terms = re.findall(
+        r"[A-Za-z_][A-Za-z0-9_.$:/-]{1,127}|[\u3400-\u9fff]+",
+        text,
+    )
+    return " OR ".join(
+        '"' + term.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        for term in terms[:64]
+    )
 
 
 def _related_test_map(
-    records: List[Dict[str, Any]],
+    records: Sequence[Dict[str, Any]],
 ) -> Dict[str, List[str]]:
-    source_by_stem: Dict[str, List[str]] = {}
+    sources: Dict[str, List[str]] = {}
     tests = []
     for record in records:
         path = record["path"]
-        stem = Path(path).stem
         if _is_test_path(path):
             tests.append(path)
         else:
-            source_by_stem.setdefault(stem, []).append(path)
+            sources.setdefault(Path(path).stem, []).append(path)
     result: Dict[str, List[str]] = {}
     for test in tests:
-        target_stem = Path(test).stem.removeprefix("test_")
-        for source in source_by_stem.get(target_stem, []):
+        stem = Path(test).stem.removeprefix("test_")
+        for source in sources.get(stem, []):
             result.setdefault(source, []).append(test)
     return {
-        path: sorted(set(paths))
-        for path, paths in result.items()
+        path: sorted(set(paths)) for path, paths in result.items()
     }
 
 
 def _module_aliases(
-    records: List[Dict[str, Any]],
+    records: Sequence[Dict[str, Any]],
 ) -> Dict[str, str]:
     aliases: Dict[str, str] = {}
     for record in records:
         path = record["path"]
         file_path = Path(path)
-        if file_path.suffix.lower() not in {
-            ".py",
-            ".js",
-            ".jsx",
-            ".ts",
-            ".tsx",
-        }:
-            continue
         no_suffix = file_path.with_suffix("").as_posix()
         candidates = {
             no_suffix,
@@ -1368,9 +1417,6 @@ def _module_aliases(
         if file_path.stem == "__init__":
             parent = file_path.parent.as_posix()
             candidates.update({parent, parent.replace("/", ".")})
-            if parent.startswith("src/"):
-                stripped = parent[4:]
-                candidates.update({stripped, stripped.replace("/", ".")})
         for candidate in candidates:
             aliases.setdefault(candidate, path)
     return aliases
@@ -1382,22 +1428,15 @@ def _resolve_import(
     aliases: Dict[str, str],
 ) -> str:
     normalized = target.strip().strip("\"'")
-    if not normalized:
-        return ""
     if normalized.startswith("."):
         importer_path = Path(importer)
-        candidate = (importer_path.parent / normalized).as_posix()
-        candidate = str(Path(candidate))
-        for suffix in ("", ".py", ".js", ".ts", "/__init__.py"):
-            resolved = aliases.get(candidate + suffix)
-            if resolved:
-                return resolved
-        python_target = normalized.lstrip(".")
-        parent_parts = list(importer_path.parent.parts)
-        levels = len(normalized) - len(normalized.lstrip("."))
-        base = parent_parts[: max(0, len(parent_parts) - levels + 1)]
-        dotted = ".".join([*base, python_target]).strip(".")
-        return aliases.get(dotted, "")
+        dotted = ".".join(
+            [
+                *importer_path.parent.parts,
+                normalized.lstrip("."),
+            ]
+        ).strip(".")
+        return aliases.get(dotted, aliases.get(normalized.lstrip("."), ""))
     return aliases.get(normalized, "")
 
 
@@ -1410,24 +1449,6 @@ def _is_test_path(path: str) -> bool:
         or name.startswith("test_")
         or name.endswith(("_test.py", ".test.js", ".test.ts", ".spec.ts"))
     )
-
-
-def _index_terms(text: str) -> Set[str]:
-    lowered = text.lower()
-    terms = set(re.findall(r"[a-z_][a-z0-9_.$:/-]{1,127}", lowered))
-    for sequence in re.findall(r"[\u3400-\u9fff]+", lowered):
-        if len(sequence) == 1:
-            terms.add(sequence)
-        else:
-            terms.update(
-                sequence[index : index + 2]
-                for index in range(len(sequence) - 1)
-            )
-    return terms
-
-
-def _query_terms(query: str) -> List[str]:
-    return sorted(_index_terms(query), key=lambda item: (-len(item), item))
 
 
 def _now() -> str:

@@ -16,6 +16,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from xml.etree import ElementTree
 
 from .workspace import Workspace
+from .vector_store import (
+    ChromaVectorStore,
+    VectorRecord,
+    content_fingerprint,
+    reciprocal_rank_fusion,
+)
 
 KNOWLEDGE_VERSION = 1
 DEFAULT_CHUNK_CHARS = 1_800
@@ -417,6 +423,7 @@ class KnowledgeBase:
         parser: Optional[DocumentParser] = None,
         chunk_chars: int = DEFAULT_CHUNK_CHARS,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+        vector_store: Optional[ChromaVectorStore] = None,
     ) -> None:
         if chunk_chars < 200:
             raise ValueError("chunk_chars must be at least 200")
@@ -428,6 +435,8 @@ class KnowledgeBase:
         self.parser = parser or DocumentParser()
         self.chunk_chars = chunk_chars
         self.chunk_overlap = chunk_overlap
+        self.vector_store = vector_store or ChromaVectorStore.from_env(workspace)
+        self.vector_error = ""
 
     def ingest(
         self,
@@ -527,6 +536,39 @@ class KnowledgeBase:
                     ),
                 )
 
+        try:
+            self.vector_store.replace_group(
+                "knowledge_chunks",
+                document_id,
+                [
+                    VectorRecord(
+                        id=content_fingerprint(
+                            "knowledge",
+                            document_id,
+                            str(chunk_index),
+                        ),
+                        text=section.text,
+                        content_hash=content_fingerprint(
+                            raw_hash,
+                            str(chunk_index),
+                            section.text,
+                        ),
+                        metadata={
+                            "group": document_id,
+                            "document_id": document_id,
+                            "source_name": display_name,
+                            "chunk_index": chunk_index,
+                            "heading": section.heading,
+                            "location": section.location,
+                        },
+                    )
+                    for chunk_index, section in enumerate(chunks, start=1)
+                ],
+            )
+            self.vector_error = ""
+        except Exception as exc:
+            self.vector_error = f"{type(exc).__name__}: {exc}"[:2_000]
+
         return KnowledgeDocument(
             document_id=document_id,
             source_name=display_name,
@@ -563,7 +605,11 @@ class KnowledgeBase:
             for row in rows
         ]
 
-    def search(self, query: str, limit: int = 5) -> List[KnowledgeHit]:
+    def _search_keyword(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> List[KnowledgeHit]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("knowledge query must be a non-empty string")
         if not isinstance(limit, int) or not 1 <= limit <= 20:
@@ -602,6 +648,67 @@ class KnowledgeBase:
                 score=round(-float(row["rank"]), 6),
             )
             for row in rows
+        ]
+
+    def search(self, query: str, limit: int = 5) -> List[KnowledgeHit]:
+        """Fuse keyword BM25 and Chroma vector matches."""
+        keyword_hits = self._search_keyword(
+            query,
+            min(20, max(limit * 3, limit)),
+        )
+        try:
+            vector_hits = self.vector_store.query(
+                "knowledge_chunks",
+                query,
+                min(20, max(limit * 3, limit)),
+            )
+            self.vector_error = ""
+        except Exception as exc:
+            self.vector_error = f"{type(exc).__name__}: {exc}"[:2_000]
+            vector_hits = []
+        keyword_ids = [
+            f"{hit.document_id}:{hit.chunk_index}" for hit in keyword_hits
+        ]
+        vector_ids = [
+            f"{hit.metadata.get('document_id', '')}:"
+            f"{int(hit.metadata.get('chunk_index', 0))}"
+            for hit in vector_hits
+        ]
+        fused = reciprocal_rank_fusion([keyword_ids, vector_ids])
+        candidates = {
+            f"{hit.document_id}:{hit.chunk_index}": hit
+            for hit in keyword_hits
+        }
+        for hit in vector_hits:
+            document_id = str(hit.metadata.get("document_id", ""))
+            chunk_index = int(hit.metadata.get("chunk_index", 0))
+            key = f"{document_id}:{chunk_index}"
+            if key in candidates or not document_id or chunk_index < 1:
+                continue
+            candidates[key] = KnowledgeHit(
+                document_id=document_id,
+                source_name=str(hit.metadata.get("source_name", "")),
+                chunk_index=chunk_index,
+                heading=str(hit.metadata.get("heading", "")),
+                location=str(hit.metadata.get("location", "")),
+                content=hit.text,
+                score=0.0,
+            )
+        ordered = sorted(
+            candidates.items(),
+            key=lambda item: (-fused.get(item[0], 0.0), item[0]),
+        )
+        return [
+            KnowledgeHit(
+                document_id=hit.document_id,
+                source_name=hit.source_name,
+                chunk_index=hit.chunk_index,
+                heading=hit.heading,
+                location=hit.location,
+                content=hit.content,
+                score=round(fused.get(key, 0.0), 8),
+            )
+            for key, hit in ordered[:limit]
         ]
 
     def read_chunk(self, document_id: str, chunk_index: int) -> KnowledgeHit:
@@ -654,6 +761,11 @@ class KnowledgeBase:
                 "DELETE FROM documents WHERE id = ?",
                 (document_id,),
             )
+        try:
+            self.vector_store.remove_group("knowledge_chunks", document_id)
+            self.vector_error = ""
+        except Exception as exc:
+            self.vector_error = f"{type(exc).__name__}: {exc}"[:2_000]
         return True
 
     def _make_chunks(

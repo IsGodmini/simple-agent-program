@@ -22,9 +22,10 @@ OpenAI-compatible Chat Completions 接口发送到用户配置的 LLM 服务。
 | `context.py` | Token 估算及完整工具交互块压缩 |
 | `session.py` | 单次需求生命周期、Episode 和 trace |
 | `memory.py` | 会话摘要、需求摘要、场景记忆检索和上下文构建 |
-| `knowledge.py` | 多格式文档解析、分块和本地 FTS5 RAG |
+| `knowledge.py` | 多格式文档解析、分块和 FTS5/Chroma 混合 RAG |
 | `project_index.py` | 持久化项目树、代码块、符号和依赖增量索引 |
-| `project_graph.py` | Neo4j 优先的项目关系图、SQLite 保底和文件功能档案 |
+| `project_graph.py` | Neo4j 唯一关系图和 LLM 文件功能档案 |
+| `vector_store.py` | Chroma 持久化、Embedding 和 RRF 混合排序 |
 | `tools/` | 文件、命令、项目索引、知识库和记忆工具 |
 | `webapp.py` | 本地 HTTP API、后台 Job 和工作区串行调度 |
 | `web/` | 无构建步骤的 HTML、CSS 和 JavaScript 客户端 |
@@ -92,8 +93,8 @@ Planner 和 Reviewer 没有 `apply_patch`。Reviewer 使用比 Executor 更严�
 ├── index/
 │   ├── project-index.db
 │   └── repository-map.json
-├── graph/
-│   └── project-graph.db
+├── vector/
+│   └── <Chroma persistent data>
 ├── knowledge/
 │   └── knowledge.db
 ├── memory/
@@ -103,9 +104,9 @@ Planner 和 Reviewer 没有 `apply_patch`。Reviewer 使用比 Executor 更严�
     └── <requirement-id>.json
 ```
 
-这些文件不会进入 Git，也不会被普通文件工具返回。图谱默认请求 Neo4j，并持续
-维护 SQLite 查询缓存；配置不完整或同步失败时 SQLite 自动成为活动后端。会话和
-需求摘要使用 JSON。
+这些文件不会进入 Git，也不会被普通文件工具返回。SQLite 保存源码/知识关键词
+索引，Chroma 保存向量，Neo4j 是工作区关系图和文件档案的唯一存储。会话和需求
+摘要使用 JSON。
 
 ## 隔离和并发
 

@@ -1,99 +1,109 @@
-# 项目知识图谱与文件功能档案
+# Neo4j 项目图谱、LLM 文件档案与 Chroma 检索
 
-## 目标
+## 数据职责
 
-项目知识图谱用于回答“哪个文件负责什么”“这个文件依赖谁”“修改它可能影响哪些
-文件和测试”。它建立在增量源码索引之上，目的是把反复通读整个项目降为最低
-优先级，而不是替代源码。
+项目理解层使用三类互相独立的存储：
 
-首次构建仍需由源码索引读取所有符合安全规则的文件。此后刷新先比较路径、大小、
-修改时间和内容哈希，只为变化文件重建索引与功能档案；图关系从本地索引记录重建，
-不会重新读取未变化源码。`apply_patch` 成功后会立即刷新对应路径，外部编辑器的
-变化会在下个需求开始时被发现。
+- SQLite 源码索引：文件元数据、代码块、符号、import 和 FTS5/BM25；
+- Neo4j：唯一项目关系图和文件功能档案存储；
+- Chroma：代码块、知识片段、文件档案和记忆摘要的向量。
 
-## 数据模型
+不存在 SQLite 图谱副本。Neo4j 不可用时，关键词源码索引仍可工作，但图谱工具会
+返回不可用状态。
 
-本地数据库位于：
+## 增量构建
 
-```text
-.simple-agent/graph/project-graph.db
-```
+1. 源码索引先用大小和修改时间检查变化，只重新读取变化文件并计算内容哈希。
+2. 每次 `apply_patch` 只更新确定性源码索引，并将对应 Neo4j 文件节点标记为
+   `stale=true`；此时不调用档案 LLM，也不重新生成 Embedding。
+3. 需求完成后按去重的变化文件列表执行一次批量刷新。
+4. 从索引缓存取得变化文件的代码片段、符号和 import 证据。
+5. 对内容哈希或档案版本发生变化的文件，按最多 2 个文件一批调用 LLM，并限制为
+   最多 3 批并发；档案请求使用独立的输出预算和超时，避免阻塞主 Agent。
+6. LLM 输出 `purpose`、`responsibilities`、`confidence` 和行号证据。
+7. 每个成功批次立即以 `draft=true` 暂存到 Neo4j；若其他批次失败，下次只重试
+   尚未成功的文件。
+8. 保留未变化文件已有的 Neo4j 档案。
+9. 全部档案齐全后，在一个 Neo4j 事务内替换该工作区的节点和关系快照。
+10. 按内容哈希更新 Chroma；未变化内容不重新生成 Embedding。
 
-主要节点：
+LLM 必须输出 JSON，遗漏文件或缺少用途、职责时本次图谱刷新失败，旧 Neo4j
+事务不会被部分覆盖。LLM 档案是导航信息，修改代码前仍必须读取当前源码。
+如果文件修改后恢复到原内容哈希，系统直接清除 `stale` 标记，不调用 LLM。
 
-- `Workspace`：工作区；
-- `File`：带内容哈希、语言和功能摘要的文件；
-- `Symbol`：类、函数和其他公开声明；
-- `Module`：无法直接解析为工作区文件的外部或逻辑模块。
+## Neo4j 模型
 
-主要关系：
+节点：
 
-- `CONTAINS`：工作区包含文件；
-- `DEFINES`：文件定义符号；
-- `IMPORTS`：文件导入模块；
-- `DEPENDS_ON`：导入可解析到工作区文件；
-- `TESTS`：测试文件与被测文件的启发式关联。
+- `ProjectWorkspace`
+- `ProjectFile`
+- `ProjectSymbol`
+- `ProjectModule`
+- `ProjectNode`：以上节点的公共标签
 
-每个文件档案保存内容哈希、用途、职责、公开符号、导入、关联测试、置信度和证据。
-当前用途与职责由路径、首段注释或文档字符串、符号和导入等确定性证据生成，不会
-额外调用 LLM，因此可重复且成本稳定。档案发生 `stale=true` 或需要修改实现时，
-必须读取当前源码核对。
+关系使用真实 Neo4j 类型：
 
-## 查询优先级
+- `CONTAINS`
+- `DEFINES`
+- `IMPORTS`
+- `DEPENDS_ON`
+- `TESTS`
 
-Agent 默认按以下顺序理解项目：
-
-1. `project_graph_overview` / `query_file_profiles` 找负责相关功能的文件；
-2. `file_profile` / `query_project_graph` / `impact_analysis` 看职责和影响范围；
-3. 项目源码索引工具定位精确代码片段和符号；
-4. `read_file` 读取准备修改或必须核实的真实源码；
-5. 只有图谱和索引不足时才扫描目录或全文搜索，通读全部源码为最低优先级。
-
-图谱上下文最多自动检索 6 个相关档案，引用格式为 `graph:<path>`。图谱、
-代码索引、知识库和场景记忆由同一工作区的所有会话共享。
-
-## 默认后端与自动降级
-
-默认请求 Neo4j：
+所有节点和关系带 `workspace_id`。节点使用
+`(workspace_id, node_key)` 组合唯一约束；文件档案建立 Neo4j 全文索引。
 
 ```dotenv
-PROJECT_GRAPH_BACKEND=neo4j
-```
-
-标准安装已经包含官方 Neo4j Python Driver。只有 URI、用户名和密码完整且最近
-同步成功时，状态中的活动后端才是 `neo4j`。以下任一情况会自动使用 SQLite：
-
-- Neo4j 连接配置不完整；
-- 驱动初始化或连通性检查失败；
-- 约束创建或快照同步失败。
-
-SQLite 本地图谱始终同步维护，承担低延迟查询缓存和故障保底。它支持文件档案
-FTS5 搜索以及最多四层关系遍历。下一次刷新会重试失败的 Neo4j 同步；成功后自动
-清除错误并把活动后端切回 `neo4j`。如需强制仅使用本地图谱：
-
-```dotenv
-PROJECT_GRAPH_BACKEND=sqlite
-```
-
-## Neo4j 主后端
-
-```dotenv
-PROJECT_GRAPH_BACKEND=neo4j
 NEO4J_URI=neo4j://localhost:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=change-me
 NEO4J_DATABASE=neo4j
 ```
 
-文件档案变化后，系统使用参数化 Cypher 把当前工作区节点和关系同步到 Neo4j，
-并用 `(workspace_id, node_key)` 唯一约束隔离不同工作区。SQLite 查询缓存让模型
-查询不依赖每次网络往返，也保证 Neo4j 故障不会破坏已完成的索引和代码修改。
+## Chroma 混合检索
 
-凭据只能放在未提交的 `.env` 或进程环境中。远程 Neo4j 应使用其提供的加密连接
-URI、最小权限账号和网络访问控制。当前版本不向模型开放任意 Cypher，模型只能
-调用受边界约束的图谱工具。
+Chroma 数据位于：
 
-## CLI 与 HTTP
+```text
+.simple-agent/vector/
+```
+
+集合按工作区和数据类型隔离：
+
+- `code_chunks`
+- `knowledge_chunks`
+- `file_profiles`
+- `memory_summaries`
+
+项目只允许本机 Ollama 生成 Embedding：
+
+```bash
+ollama pull qwen3-embedding:0.6b
+```
+
+```dotenv
+EMBEDDING_MODEL=qwen3-embedding:0.6b
+EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1
+```
+
+不需要 API Key。代码会拒绝非回环地址和不以 `/v1` 结尾的地址，避免源码被误发到
+远程 Embedding 服务。
+
+查询流程：
+
+```text
+FTS5/BM25 或 Neo4j 全文候选
+              +
+       Chroma 向量候选
+              ↓
+ Reciprocal Rank Fusion
+              ↓
+ 图关系扩展与上下文预算裁剪
+```
+
+代码块、知识片段和文件档案直接执行混合检索；场景记忆摘要也会写入 Chroma，并在
+相关记忆选择时与词项结果融合。Chroma 与 Neo4j 不共享生命周期或数据库连接。
+
+## 状态与操作
 
 ```bash
 simple-agent --workspace /path/to/project --refresh-graph
@@ -105,18 +115,9 @@ GET /api/project-graph?workspace=/path/to/project
 POST /api/project-graph/refresh?workspace=/path/to/project
 ```
 
-状态字段：
+状态中的 `backend` 固定为 `neo4j`，`storage` 为 `neo4j-only`。缺少配置、连接
+失败、LLM 档案生成失败或事务失败会写入 `last_error`。向量状态独立显示是否启用、
+Embedding 模型和本地 Chroma 路径。
 
-- `requested_backend`：配置要求的后端，默认 `neo4j`；
-- `backend`：当前活动后端；
-- `fallback_active` / `fallback_reason`：是否降级及原因；
-- `neo4j_last_sync`：最近成功同步时间；
-- `neo4j_last_error`：最近同步错误。
-
-## 一致性边界
-
-- 本地 Agent 编辑通过回调同步对应文件；
-- 外部编辑在下一需求的全工作区元数据检查中发现；
-- Neo4j 当前按变化触发工作区快照同步，不是逐边事务日志；
-- 异常退出可能使 Neo4j 暂时落后，本地 SQLite 会立即接管；
-- 删除 `.simple-agent/graph/` 只会丢失可重建图谱，不会删除源码、记忆或知识库。
+旧版本可能遗留 `.simple-agent/graph/project-graph.db`；新代码不会读取或更新它。
+确认不需要回退旧版本后可以手动删除 `.simple-agent/graph/`。
